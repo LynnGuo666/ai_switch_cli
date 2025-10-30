@@ -65,29 +65,18 @@ else
     STATUS_UNKNOWN_TEXT="未知"
 fi
 
-# 函数：获取健康检查状态
+# 函数：获取健康检查状态（实时拉取，不使用缓存）
 fetch_health_status() {
-    local cache_age=999999
-    if [[ -f "$HEALTH_CHECK_CACHE_FILE" ]]; then
-        cache_age=$(($(date +%s) - $(stat -f %m "$HEALTH_CHECK_CACHE_FILE" 2>/dev/null || stat -c %Y "$HEALTH_CHECK_CACHE_FILE" 2>/dev/null || echo 0)))
-    fi
-    
-    if [[ $cache_age -lt $HEALTH_CHECK_CACHE_TTL ]]; then
-        cat "$HEALTH_CHECK_CACHE_FILE" 2>/dev/null
-        return
-    fi
-    
+    echo -e "${GRAY}正在拉取渠道状态...${RESET}" >&2
     local response=$(curl -s "$HEALTH_CHECK_URL" 2>/dev/null)
     if [[ $? -eq 0 && -n "$response" ]]; then
-        echo "$response" > "$HEALTH_CHECK_CACHE_FILE"
         echo "$response"
     else
-        # 如果请求失败，尝试使用缓存
-        cat "$HEALTH_CHECK_CACHE_FILE" 2>/dev/null || echo '{"services":{}}'
+        echo '{"services":{}}'
     fi
 }
 
-# 函数：根据channel_id获取服务状态
+# 函数：根据channel_id获取服务状态和lastCheck时间
 get_channel_status() {
     local channel_id="$1"
     local health_data=$(fetch_health_status)
@@ -96,9 +85,9 @@ get_channel_status() {
     local last_check=$(echo "$health_data" | jq -r ".services.\"$channel_id\".lastCheck // \"\"" 2>/dev/null)
     
     if [[ "$status" == "null" || "$status" == "" ]]; then
-        echo "unknown"
+        echo "unknown|"
     else
-        echo "$status"
+        echo "$status|$last_check"
     fi
 }
 
@@ -347,6 +336,13 @@ list_configs() {
         return
     fi
     
+    # 拉取实时状态（仅在list_configs中使用）
+    echo -e "${GRAY}正在拉取渠道状态...${RESET}"
+    local health_data=$(curl -s "$HEALTH_CHECK_URL" 2>/dev/null)
+    if [[ $? -ne 0 || -z "$health_data" ]]; then
+        health_data='{"services":{}}'
+    fi
+    
     echo -e "${BOLD}配置列表 ($ai_type):${RESET}"
     echo "=========================================="
     
@@ -355,13 +351,17 @@ list_configs() {
         local channel_id=$(jq -r ".configs[$i].channel_id // \"\"" "$config_file")
         local status=""
         local status_icon=""
+        local last_check=""
         
         if [[ -n "$channel_id" && "$channel_id" != "null" && "$channel_id" != "" ]]; then
-            status=$(get_channel_status "$channel_id")
-            if [[ "$status" == "ok" ]]; then
+            local channel_info=$(get_channel_info_from_data "$channel_id" "$health_data")
+            local status_val=$(echo "$channel_info" | cut -d'|' -f1)
+            last_check=$(echo "$channel_info" | cut -d'|' -f2)
+            
+            if [[ "$status_val" == "ok" ]]; then
                 status_icon="$STATUS_OK"
                 status="$STATUS_OK_TEXT"
-            elif [[ "$status" == "error" ]]; then
+            elif [[ "$status_val" == "error" ]]; then
                 status_icon="$STATUS_ERROR"
                 status="$STATUS_ERROR_TEXT"
             else
@@ -375,7 +375,12 @@ list_configs() {
         
         echo -e "${BOLD}[$i]${RESET} $status_icon ${CYAN}$name${RESET}"
         if [[ -n "$channel_id" && "$channel_id" != "null" && "$channel_id" != "" ]]; then
-            echo -e "    ${GRAY}渠道ID:${RESET} ${CYAN}$channel_id${RESET} ${GRAY}|${RESET} ${GRAY}状态:${RESET} $status"
+            local time_ago=$(format_time_ago "$last_check")
+            if [[ -n "$time_ago" ]]; then
+                echo -e "    ${GRAY}渠道ID:${RESET} ${CYAN}$channel_id${RESET} ${GRAY}|${RESET} ${GRAY}状态:${RESET} $status ${GRAY}($time_ago)${RESET}"
+            else
+                echo -e "    ${GRAY}渠道ID:${RESET} ${CYAN}$channel_id${RESET} ${GRAY}|${RESET} ${GRAY}状态:${RESET} $status"
+            fi
         fi
         
         if [[ "$ai_type" == "claude" ]]; then
@@ -394,7 +399,13 @@ show_status() {
     echo -e "${BOLD}渠道状态检查${RESET}"
     echo "=========================================="
     
-    local health_data=$(fetch_health_status)
+    # 拉取实时状态
+    echo -e "${GRAY}正在拉取渠道状态...${RESET}"
+    local health_data=$(curl -s "$HEALTH_CHECK_URL" 2>/dev/null)
+    if [[ $? -ne 0 || -z "$health_data" ]]; then
+        health_data='{"services":{}}'
+    fi
+    
     local services=$(echo "$health_data" | jq -r '.services | keys[]' 2>/dev/null)
     
     if [[ -z "$services" ]]; then
@@ -426,7 +437,8 @@ show_status() {
             local name=$(jq -r ".configs[$i].name" "$CLAUDE_CONFIG_FILE" 2>/dev/null)
             local channel_id=$(jq -r ".configs[$i].channel_id // \"\"" "$CLAUDE_CONFIG_FILE" 2>/dev/null)
             if [[ -n "$channel_id" && "$channel_id" != "null" && "$channel_id" != "" ]]; then
-                local status=$(get_channel_status "$channel_id")
+                local channel_info=$(get_channel_info_from_data "$channel_id" "$health_data")
+                local status=$(echo "$channel_info" | cut -d'|' -f1)
                 if [[ "$status" == "ok" ]]; then
                     echo -e "$STATUS_OK ${BOLD}Claude:${RESET} ${CYAN}$name${RESET} ${GRAY}($channel_id)${RESET}"
                 elif [[ "$status" == "error" ]]; then
@@ -445,7 +457,8 @@ show_status() {
             local name=$(jq -r ".configs[$i].name" "$CODEX_CONFIG_FILE" 2>/dev/null)
             local channel_id=$(jq -r ".configs[$i].channel_id // \"\"" "$CODEX_CONFIG_FILE" 2>/dev/null)
             if [[ -n "$channel_id" && "$channel_id" != "null" && "$channel_id" != "" ]]; then
-                local status=$(get_channel_status "$channel_id")
+                local channel_info=$(get_channel_info_from_data "$channel_id" "$health_data")
+                local status=$(echo "$channel_info" | cut -d'|' -f1)
                 if [[ "$status" == "ok" ]]; then
                     echo -e "$STATUS_OK ${BOLD}Codex:${RESET} ${CYAN}$name${RESET} ${GRAY}($channel_id)${RESET}"
                 elif [[ "$status" == "error" ]]; then
@@ -615,8 +628,12 @@ config_count=$(jq '.configs | length' "$CONFIG_FILE")
 # 创建临时文件来存储排序后的配置
 temp_file=$(mktemp)
 
-# 获取健康检查状态
-health_data=$(fetch_health_status)
+# 在脚本开始时拉取健康检查状态（全局使用，运行期间都可以使用）
+echo -e "${GRAY}正在拉取渠道状态...${RESET}"
+health_data=$(curl -s "$HEALTH_CHECK_URL" 2>/dev/null)
+if [[ $? -ne 0 || -z "$health_data" ]]; then
+    health_data='{"services":{}}'
+fi
 
 # 获取当前配置名称（用于高亮显示）
 current_config_name=""
@@ -645,6 +662,126 @@ if [[ -n "$CURRENT_TOKEN" && -n "$CURRENT_URL" ]]; then
     done
 fi
 
+# 获取健康检查状态（实时拉取，不使用缓存）
+# 注意：这个函数现在不再使用，因为我们在脚本开始时就已经拉取了
+# 保留此函数是为了兼容其他可能调用的地方
+fetch_health_status() {
+    echo -e "${GRAY}正在拉取渠道状态...${RESET}" >&2
+    local response=$(curl -s "$HEALTH_CHECK_URL" 2>/dev/null)
+    if [[ $? -eq 0 && -n "$response" ]]; then
+        echo "$response"
+    else
+        echo '{"services":{}}'
+    fi
+}
+
+# 函数：格式化时间显示为"xx分钟前"（处理UTC时间）
+format_time_ago() {
+    local utc_time="$1"
+    if [[ -z "$utc_time" || "$utc_time" == "null" || "$utc_time" == "" ]]; then
+        echo ""
+        return
+    fi
+    
+    # 检查是否有date命令
+    if ! command -v date &> /dev/null; then
+        echo "$(echo "$utc_time" | cut -d'T' -f2 | cut -d'.' -f1)"
+        return
+    fi
+    
+    # 解析UTC时间字符串（格式：2025-10-30T09:30:06.294Z）
+    local date_part=$(echo "$utc_time" | cut -d'T' -f1)
+    local time_part=$(echo "$utc_time" | cut -d'T' -f2 | cut -d'.' -f1 | cut -d'Z' -f1)
+    
+    # macOS date命令
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # 提取年月日时分秒
+        local year=$(echo "$date_part" | cut -d'-' -f1)
+        local month=$(echo "$date_part" | cut -d'-' -f2)
+        local day=$(echo "$date_part" | cut -d'-' -f3)
+        local hour=$(echo "$time_part" | cut -d':' -f1)
+        local minute=$(echo "$time_part" | cut -d':' -f2)
+        local second=$(echo "$time_part" | cut -d':' -f3)
+        
+        # 转换为Unix时间戳（UTC）
+        local utc_timestamp=$(date -u -j -f "%Y-%m-%d %H:%M:%S" "${year}-${month}-${day} ${hour}:${minute}:${second}" "+%s" 2>/dev/null)
+        
+        if [[ -n "$utc_timestamp" ]]; then
+            local current_timestamp=$(date +%s)
+            local diff_seconds=$((current_timestamp - utc_timestamp))
+            
+            if [[ $diff_seconds -lt 0 ]]; then
+                echo "刚刚"
+                return
+            fi
+            
+            local diff_minutes=$((diff_seconds / 60))
+            
+            if [[ $diff_minutes -lt 1 ]]; then
+                echo "刚刚"
+            elif [[ $diff_minutes -lt 60 ]]; then
+                echo "${diff_minutes}分钟前"
+            else
+                local diff_hours=$((diff_minutes / 60))
+                if [[ $diff_hours -lt 24 ]]; then
+                    echo "${diff_hours}小时前"
+                else
+                    local diff_days=$((diff_hours / 24))
+                    echo "${diff_days}天前"
+                fi
+            fi
+        else
+            echo "$time_part"
+        fi
+    else
+        # Linux date命令（GNU date）
+        local utc_timestamp=$(date -d "$utc_time" +%s 2>/dev/null)
+        
+        if [[ -n "$utc_timestamp" ]]; then
+            local current_timestamp=$(date +%s)
+            local diff_seconds=$((current_timestamp - utc_timestamp))
+            
+            if [[ $diff_seconds -lt 0 ]]; then
+                echo "刚刚"
+                return
+            fi
+            
+            local diff_minutes=$((diff_seconds / 60))
+            
+            if [[ $diff_minutes -lt 1 ]]; then
+                echo "刚刚"
+            elif [[ $diff_minutes -lt 60 ]]; then
+                echo "${diff_minutes}分钟前"
+            else
+                local diff_hours=$((diff_minutes / 60))
+                if [[ $diff_hours -lt 24 ]]; then
+                    echo "${diff_hours}小时前"
+                else
+                    local diff_days=$((diff_hours / 24))
+                    echo "${diff_days}天前"
+                fi
+            fi
+        else
+            echo "$time_part"
+        fi
+    fi
+}
+
+# 函数：根据channel_id获取服务状态和lastCheck时间（从已拉取的数据中）
+get_channel_info_from_data() {
+    local channel_id="$1"
+    local health_data="$2"
+    
+    local status=$(echo "$health_data" | jq -r ".services.\"$channel_id\".status // \"unknown\"" 2>/dev/null)
+    local last_check=$(echo "$health_data" | jq -r ".services.\"$channel_id\".lastCheck // \"\"" 2>/dev/null)
+    
+    if [[ "$status" == "null" || "$status" == "" ]]; then
+        echo "unknown||"
+    else
+        echo "$status|$last_check|"
+    fi
+}
+
 # 将配置信息写入临时文件，包含索引信息
 for ((i=0; i<config_count; i++)); do
     name=$(jq -r ".configs[$i].name" "$CONFIG_FILE")
@@ -656,8 +793,12 @@ for ((i=0; i<config_count; i++)); do
     # 获取渠道状态
     status_icon=""
     status_color=""
+    last_check_time=""
     if [[ -n "$channel_id" && "$channel_id" != "null" && "$channel_id" != "" ]]; then
-        status=$(get_channel_status "$channel_id")
+        channel_info=$(get_channel_info_from_data "$channel_id" "$health_data")
+        status=$(echo "$channel_info" | cut -d'|' -f1)
+        last_check_time=$(echo "$channel_info" | cut -d'|' -f2)
+        
         if [[ "$status" == "ok" ]]; then
             status_icon="$STATUS_OK"
             status_color="ok"
@@ -693,7 +834,7 @@ for ((i=0; i<config_count; i++)); do
     # 计算总价格（输入+输出）
     total_price=$(echo "$input_num + $output_num" | bc -l 2>/dev/null || echo "0")
     
-    echo "$i|$name|$input_price|$output_price|$description|$total_price|$status_icon|$channel_id|$status_color" >> "$temp_file"
+    echo "$i|$name|$input_price|$output_price|$description|$total_price|$status_icon|$channel_id|$status_color|$last_check_time" >> "$temp_file"
 done
 
     # 按总价格排序（从低到高）
@@ -706,7 +847,7 @@ done
 
 # 显示排序后的配置
 line_num=1
-while IFS='|' read -r index name input_price output_price description total_price status_icon channel_id status_color; do
+while IFS='|' read -r index name input_price output_price description total_price status_icon channel_id status_color last_check_time; do
     # 判断是否是当前配置
     if [[ "$name" == "$current_config_name" ]]; then
         name_color="${GOLD}"
@@ -715,7 +856,17 @@ while IFS='|' read -r index name input_price output_price description total_pric
     fi
     
     # 显示配置名称（前面始终有点，有状态用对应颜色，无状态用灰色）
-    echo -e "${BOLD}$line_num)${RESET} $status_icon ${name_color}$name${RESET}"
+    if [[ -n "$last_check_time" && "$last_check_time" != "" ]]; then
+        # 格式化时间显示为"xx分钟前"
+        time_ago=$(format_time_ago "$last_check_time")
+        if [[ -n "$time_ago" ]]; then
+            echo -e "${BOLD}$line_num)${RESET} $status_icon ${name_color}$name${RESET} ${GRAY}($time_ago)${RESET}"
+        else
+            echo -e "${BOLD}$line_num)${RESET} $status_icon ${name_color}$name${RESET}"
+        fi
+    else
+        echo -e "${BOLD}$line_num)${RESET} $status_icon ${name_color}$name${RESET}"
+    fi
     
     # 显示价格信息（全部改为灰色）
     echo -e "    ${GRAY}输入: $input_price | 输出: $output_price${RESET}"
