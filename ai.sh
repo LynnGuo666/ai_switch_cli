@@ -19,7 +19,10 @@ fi
 # 优先加载配置文件路径
 CLAUDE_CONFIG_FILE="$(dirname "$0")/claude_configs.json"
 CODEX_CONFIG_FILE="$(dirname "$0")/codex_configs.json"
-HEALTH_CHECK_URL="https://check-cx.59188888.xyz/health"
+HEALTH_CHECK_CONFIG_FILE="$(dirname "$0")/health_check_configs.json"
+
+# 默认健康检查URL（如果没有配置文件或配置文件为空时使用）
+DEFAULT_HEALTH_CHECK_URL="https://check-cx.59188888.xyz/health"
 
 # 健康检查数据缓存（避免频繁请求）
 HEALTH_CHECK_CACHE_FILE="/tmp/ai_health_check_cache.json"
@@ -65,15 +68,57 @@ else
     STATUS_UNKNOWN_TEXT="未知"
 fi
 
-# 函数：获取健康检查状态（实时拉取，不使用缓存）
-fetch_health_status() {
-    echo -e "${GRAY}正在拉取渠道状态...${RESET}" >&2
-    local response=$(curl -s "$HEALTH_CHECK_URL" 2>/dev/null)
+# 函数：获取健康检查URL列表
+get_health_check_urls() {
+    # 如果配置文件存在，从中读取URL列表
+    if [[ -f "$HEALTH_CHECK_CONFIG_FILE" ]]; then
+        local urls=$(jq -r '.health_check_urls[]?' "$HEALTH_CHECK_CONFIG_FILE" 2>/dev/null)
+        if [[ -n "$urls" ]]; then
+            echo "$urls"
+            return
+        fi
+    fi
+    
+    # 如果没有配置文件或配置文件为空，使用默认URL
+    echo "$DEFAULT_HEALTH_CHECK_URL"
+}
+
+# 函数：从单个URL获取健康检查状态
+fetch_single_health_status() {
+    local url="$1"
+    local response=$(curl -s --max-time 5 "$url" 2>/dev/null)
     if [[ $? -eq 0 && -n "$response" ]]; then
         echo "$response"
     else
         echo '{"services":{}}'
     fi
+}
+
+# 函数：合并多个健康检查数据
+merge_health_data() {
+    local merged='{"services":{}}'
+    
+    # 读取所有URL并合并数据
+    while IFS= read -r url; do
+        if [[ -z "$url" || "$url" == "null" ]]; then
+            continue
+        fi
+        
+        local data=$(fetch_single_health_status "$url")
+        if [[ -n "$data" && "$data" != '{"services":{}}' ]]; then
+            # 使用jq合并services对象
+            merged=$(echo "$merged" | jq --argjson new "$data" '.services * $new.services | {services: .}' 2>/dev/null || echo "$merged")
+        fi
+    done <<< "$(get_health_check_urls)"
+    
+    echo "$merged"
+}
+
+# 函数：获取健康检查状态（实时拉取，不使用缓存）
+# 支持从多个URL获取数据并合并
+fetch_health_status() {
+    echo -e "${GRAY}正在拉取渠道状态...${RESET}" >&2
+    merge_health_data
 }
 
 # 函数：格式化时间显示为"xx分钟前"（处理UTC时间）
@@ -444,11 +489,7 @@ list_configs() {
     fi
     
     # 拉取实时状态（仅在list_configs中使用）
-    echo -e "${GRAY}正在拉取渠道状态...${RESET}"
-    local health_data=$(curl -s "$HEALTH_CHECK_URL" 2>/dev/null)
-    if [[ $? -ne 0 || -z "$health_data" ]]; then
-        health_data='{"services":{}}'
-    fi
+    local health_data=$(fetch_health_status)
     
     echo -e "${BOLD}配置列表 ($ai_type):${RESET}"
     echo "=========================================="
@@ -507,11 +548,7 @@ show_status() {
     echo "=========================================="
     
     # 拉取实时状态
-    echo -e "${GRAY}正在拉取渠道状态...${RESET}"
-    local health_data=$(curl -s "$HEALTH_CHECK_URL" 2>/dev/null)
-    if [[ $? -ne 0 || -z "$health_data" ]]; then
-        health_data='{"services":{}}'
-    fi
+    local health_data=$(fetch_health_status)
     
     local services=$(echo "$health_data" | jq -r '.services | keys[]' 2>/dev/null)
     
@@ -777,11 +814,7 @@ config_count=$(jq '.configs | length' "$CONFIG_FILE")
 temp_file=$(mktemp)
 
 # 在脚本开始时拉取健康检查状态（全局使用，运行期间都可以使用）
-echo -e "${GRAY}正在拉取渠道状态...${RESET}"
-health_data=$(curl -s "$HEALTH_CHECK_URL" 2>/dev/null)
-if [[ $? -ne 0 || -z "$health_data" ]]; then
-    health_data='{"services":{}}'
-fi
+health_data=$(fetch_health_status)
 
 # 获取当前配置名称（用于高亮显示）
 current_config_name=""
