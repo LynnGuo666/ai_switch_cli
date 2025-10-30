@@ -76,6 +76,113 @@ fetch_health_status() {
     fi
 }
 
+# 函数：格式化时间显示为"xx分钟前"（处理UTC时间）
+format_time_ago() {
+    local utc_time="$1"
+    if [[ -z "$utc_time" || "$utc_time" == "null" || "$utc_time" == "" ]]; then
+        echo ""
+        return
+    fi
+    
+    # 检查是否有date命令
+    if ! command -v date &> /dev/null; then
+        echo "$(echo "$utc_time" | cut -d'T' -f2 | cut -d'.' -f1)"
+        return
+    fi
+    
+    # 解析UTC时间字符串（格式：2025-10-30T09:30:06.294Z）
+    local date_part=$(echo "$utc_time" | cut -d'T' -f1)
+    local time_part=$(echo "$utc_time" | cut -d'T' -f2 | cut -d'.' -f1 | cut -d'Z' -f1)
+    
+    # macOS date命令
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # 提取年月日时分秒
+        local year=$(echo "$date_part" | cut -d'-' -f1)
+        local month=$(echo "$date_part" | cut -d'-' -f2)
+        local day=$(echo "$date_part" | cut -d'-' -f3)
+        local hour=$(echo "$time_part" | cut -d':' -f1)
+        local minute=$(echo "$time_part" | cut -d':' -f2)
+        local second=$(echo "$time_part" | cut -d':' -f3)
+        
+        # 转换为Unix时间戳（UTC）
+        local utc_timestamp=$(date -u -j -f "%Y-%m-%d %H:%M:%S" "${year}-${month}-${day} ${hour}:${minute}:${second}" "+%s" 2>/dev/null)
+        
+        if [[ -n "$utc_timestamp" ]]; then
+            local current_timestamp=$(date +%s)
+            local diff_seconds=$((current_timestamp - utc_timestamp))
+            
+            if [[ $diff_seconds -lt 0 ]]; then
+                echo "刚刚"
+                return
+            fi
+            
+            local diff_minutes=$((diff_seconds / 60))
+            
+            if [[ $diff_minutes -lt 1 ]]; then
+                echo "刚刚"
+            elif [[ $diff_minutes -lt 60 ]]; then
+                echo "${diff_minutes}分钟前"
+            else
+                local diff_hours=$((diff_minutes / 60))
+                if [[ $diff_hours -lt 24 ]]; then
+                    echo "${diff_hours}小时前"
+                else
+                    local diff_days=$((diff_hours / 24))
+                    echo "${diff_days}天前"
+                fi
+            fi
+        else
+            echo "$time_part"
+        fi
+    else
+        # Linux date命令（GNU date）
+        local utc_timestamp=$(date -d "$utc_time" +%s 2>/dev/null)
+        
+        if [[ -n "$utc_timestamp" ]]; then
+            local current_timestamp=$(date +%s)
+            local diff_seconds=$((current_timestamp - utc_timestamp))
+            
+            if [[ $diff_seconds -lt 0 ]]; then
+                echo "刚刚"
+                return
+            fi
+            
+            local diff_minutes=$((diff_seconds / 60))
+            
+            if [[ $diff_minutes -lt 1 ]]; then
+                echo "刚刚"
+            elif [[ $diff_minutes -lt 60 ]]; then
+                echo "${diff_minutes}分钟前"
+            else
+                local diff_hours=$((diff_minutes / 60))
+                if [[ $diff_hours -lt 24 ]]; then
+                    echo "${diff_hours}小时前"
+                else
+                    local diff_days=$((diff_hours / 24))
+                    echo "${diff_days}天前"
+                fi
+            fi
+        else
+            echo "$time_part"
+        fi
+    fi
+}
+
+# 函数：根据channel_id获取服务状态和lastCheck时间（从已拉取的数据中）
+get_channel_info_from_data() {
+    local channel_id="$1"
+    local health_data="$2"
+    
+    local status=$(echo "$health_data" | jq -r ".services.\"$channel_id\".status // \"unknown\"" 2>/dev/null)
+    local last_check=$(echo "$health_data" | jq -r ".services.\"$channel_id\".lastCheck // \"\"" 2>/dev/null)
+    
+    if [[ "$status" == "null" || "$status" == "" ]]; then
+        echo "unknown||"
+    else
+        echo "$status|$last_check|"
+    fi
+}
+
 # 函数：根据channel_id获取服务状态和lastCheck时间
 get_channel_status() {
     local channel_id="$1"
@@ -373,7 +480,7 @@ list_configs() {
             status="$STATUS_UNKNOWN_TEXT (未配置)"
         fi
         
-        echo -e "${BOLD}[$i]${RESET} $status_icon ${CYAN}$name${RESET}"
+        echo -e "${BOLD}[$i]${RESET} $status_icon ${GOLD}$name${RESET}"
         if [[ -n "$channel_id" && "$channel_id" != "null" && "$channel_id" != "" ]]; then
             local time_ago=$(format_time_ago "$last_check")
             if [[ -n "$time_ago" ]]; then
@@ -413,16 +520,32 @@ show_status() {
         return
     fi
     
-    echo "$health_data" | jq -r '.services | to_entries[] | "\(.key): \(.value.status) (最后检查: \(.value.lastCheck))"' 2>/dev/null | while IFS= read -r line; do
-        local channel_id=$(echo "$line" | cut -d':' -f1)
-        local status_part=$(echo "$line" | cut -d':' -f2-)
+    echo "$health_data" | jq -r '.services | to_entries[] | "\(.key): \(.value.status): \(.value.lastCheck)"' 2>/dev/null | while IFS=':' read -r channel_id status_val last_check; do
+        # 清理变量（去除空格）
+        channel_id=$(echo "$channel_id" | xargs)
+        status_val=$(echo "$status_val" | xargs)
+        last_check=$(echo "$last_check" | xargs)
         
-        if echo "$status_part" | grep -q "ok"; then
-            echo -e "$STATUS_OK ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} $status_part"
-        elif echo "$status_part" | grep -q "error"; then
-            echo -e "$STATUS_ERROR ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} $status_part"
+        local time_ago=$(format_time_ago "$last_check")
+        
+        if [[ "$status_val" == "ok" ]]; then
+            if [[ -n "$time_ago" ]]; then
+                echo -e "$STATUS_OK ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} ${GREEN}ok${RESET} ${GRAY}($time_ago)${RESET}"
+            else
+                echo -e "$STATUS_OK ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} ${GREEN}ok${RESET}"
+            fi
+        elif [[ "$status_val" == "error" ]]; then
+            if [[ -n "$time_ago" ]]; then
+                echo -e "$STATUS_ERROR ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} ${RED}error${RESET} ${GRAY}($time_ago)${RESET}"
+            else
+                echo -e "$STATUS_ERROR ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} ${RED}error${RESET}"
+            fi
         else
-            echo -e "$STATUS_UNKNOWN ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} $status_part"
+            if [[ -n "$time_ago" ]]; then
+                echo -e "$STATUS_UNKNOWN ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} ${GRAY}unknown${RESET} ${GRAY}($time_ago)${RESET}"
+            else
+                echo -e "$STATUS_UNKNOWN ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} ${GRAY}unknown${RESET}"
+            fi
         fi
     done
     
@@ -439,12 +562,23 @@ show_status() {
             if [[ -n "$channel_id" && "$channel_id" != "null" && "$channel_id" != "" ]]; then
                 local channel_info=$(get_channel_info_from_data "$channel_id" "$health_data")
                 local status=$(echo "$channel_info" | cut -d'|' -f1)
+                local last_check=$(echo "$channel_info" | cut -d'|' -f2)
+                local time_ago=$(format_time_ago "$last_check")
+                
                 if [[ "$status" == "ok" ]]; then
-                    echo -e "$STATUS_OK ${BOLD}Claude:${RESET} ${CYAN}$name${RESET} ${GRAY}($channel_id)${RESET}"
+                    if [[ -n "$time_ago" ]]; then
+                        echo -e "$STATUS_OK ${BOLD}Claude:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET} ${GRAY}($time_ago)${RESET}"
+                    else
+                        echo -e "$STATUS_OK ${BOLD}Claude:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET}"
+                    fi
                 elif [[ "$status" == "error" ]]; then
-                    echo -e "$STATUS_ERROR ${BOLD}Claude:${RESET} ${CYAN}$name${RESET} ${GRAY}($channel_id)${RESET}"
+                    if [[ -n "$time_ago" ]]; then
+                        echo -e "$STATUS_ERROR ${BOLD}Claude:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET} ${GRAY}($time_ago)${RESET}"
+                    else
+                        echo -e "$STATUS_ERROR ${BOLD}Claude:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET}"
+                    fi
                 else
-                    echo -e "$STATUS_UNKNOWN ${BOLD}Claude:${RESET} ${CYAN}$name${RESET} ${GRAY}($channel_id)${RESET} ${GRAY}- 未找到${RESET}"
+                    echo -e "$STATUS_UNKNOWN ${BOLD}Claude:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET} ${GRAY}- 未找到${RESET}"
                 fi
             fi
         done
@@ -459,12 +593,23 @@ show_status() {
             if [[ -n "$channel_id" && "$channel_id" != "null" && "$channel_id" != "" ]]; then
                 local channel_info=$(get_channel_info_from_data "$channel_id" "$health_data")
                 local status=$(echo "$channel_info" | cut -d'|' -f1)
+                local last_check=$(echo "$channel_info" | cut -d'|' -f2)
+                local time_ago=$(format_time_ago "$last_check")
+                
                 if [[ "$status" == "ok" ]]; then
-                    echo -e "$STATUS_OK ${BOLD}Codex:${RESET} ${CYAN}$name${RESET} ${GRAY}($channel_id)${RESET}"
+                    if [[ -n "$time_ago" ]]; then
+                        echo -e "$STATUS_OK ${BOLD}Codex:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET} ${GRAY}($time_ago)${RESET}"
+                    else
+                        echo -e "$STATUS_OK ${BOLD}Codex:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET}"
+                    fi
                 elif [[ "$status" == "error" ]]; then
-                    echo -e "$STATUS_ERROR ${BOLD}Codex:${RESET} ${CYAN}$name${RESET} ${GRAY}($channel_id)${RESET}"
+                    if [[ -n "$time_ago" ]]; then
+                        echo -e "$STATUS_ERROR ${BOLD}Codex:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET} ${GRAY}($time_ago)${RESET}"
+                    else
+                        echo -e "$STATUS_ERROR ${BOLD}Codex:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET}"
+                    fi
                 else
-                    echo -e "$STATUS_UNKNOWN ${BOLD}Codex:${RESET} ${CYAN}$name${RESET} ${GRAY}($channel_id)${RESET} ${GRAY}- 未找到${RESET}"
+                    echo -e "$STATUS_UNKNOWN ${BOLD}Codex:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET} ${GRAY}- 未找到${RESET}"
                 fi
             fi
         done
@@ -538,62 +683,65 @@ if [[ -f "$CODEX_CONFIG_FILE" ]]; then
     CODEX_CONFIG_EXISTS=true
 fi
 
-# 获取当前Claude配置
-CURRENT_CLAUDE_CONFIG="未配置"
-if [[ $CLAUDE_CONFIG_EXISTS == true && -n "$ANTHROPIC_AUTH_TOKEN" && -n "$ANTHROPIC_BASE_URL" ]]; then
-    config_count=$(jq '.configs | length' "$CLAUDE_CONFIG_FILE" 2>/dev/null || echo "0")
-    for ((i=0; i<config_count; i++)); do
-        token=$(jq -r ".configs[$i].token" "$CLAUDE_CONFIG_FILE" 2>/dev/null)
-        url=$(jq -r ".configs[$i].url" "$CLAUDE_CONFIG_FILE" 2>/dev/null)
-        if [[ "$token" == "$ANTHROPIC_AUTH_TOKEN" && "$url" == "$ANTHROPIC_BASE_URL" ]]; then
-            CURRENT_CLAUDE_CONFIG=$(jq -r ".configs[$i].name" "$CLAUDE_CONFIG_FILE" 2>/dev/null)
-            break
-        fi
-    done
-fi
+# 选择AI类型（使用循环，支持输入0返回）
+while true; do
+    # 获取当前Claude配置
+    CURRENT_CLAUDE_CONFIG="未配置"
+    if [[ $CLAUDE_CONFIG_EXISTS == true && -n "$ANTHROPIC_AUTH_TOKEN" && -n "$ANTHROPIC_BASE_URL" ]]; then
+        config_count=$(jq '.configs | length' "$CLAUDE_CONFIG_FILE" 2>/dev/null || echo "0")
+        for ((i=0; i<config_count; i++)); do
+            token=$(jq -r ".configs[$i].token" "$CLAUDE_CONFIG_FILE" 2>/dev/null)
+            url=$(jq -r ".configs[$i].url" "$CLAUDE_CONFIG_FILE" 2>/dev/null)
+            if [[ "$token" == "$ANTHROPIC_AUTH_TOKEN" && "$url" == "$ANTHROPIC_BASE_URL" ]]; then
+                CURRENT_CLAUDE_CONFIG=$(jq -r ".configs[$i].name" "$CLAUDE_CONFIG_FILE" 2>/dev/null)
+                break
+            fi
+        done
+    fi
 
-# 获取当前Codex配置
-CURRENT_CODEX_CONFIG="未配置"
-if [[ $CODEX_CONFIG_EXISTS == true && -n "$OPENAI_API_KEY" && -n "$OPENAI_BASE_URL" ]]; then
-    config_count=$(jq '.configs | length' "$CODEX_CONFIG_FILE" 2>/dev/null || echo "0")
-    for ((i=0; i<config_count; i++)); do
-        api_key=$(jq -r ".configs[$i].api_key" "$CODEX_CONFIG_FILE" 2>/dev/null)
-        base_url=$(jq -r ".configs[$i].base_url" "$CODEX_CONFIG_FILE" 2>/dev/null)
-        if [[ "$api_key" == "$OPENAI_API_KEY" && "$base_url" == "$OPENAI_BASE_URL" ]]; then
-            CURRENT_CODEX_CONFIG=$(jq -r ".configs[$i].name" "$CODEX_CONFIG_FILE" 2>/dev/null)
-            break
-        fi
-    done
-fi
+    # 获取当前Codex配置
+    CURRENT_CODEX_CONFIG="未配置"
+    if [[ $CODEX_CONFIG_EXISTS == true && -n "$OPENAI_API_KEY" && -n "$OPENAI_BASE_URL" ]]; then
+        config_count=$(jq '.configs | length' "$CODEX_CONFIG_FILE" 2>/dev/null || echo "0")
+        for ((i=0; i<config_count; i++)); do
+            api_key=$(jq -r ".configs[$i].api_key" "$CODEX_CONFIG_FILE" 2>/dev/null)
+            base_url=$(jq -r ".configs[$i].base_url" "$CODEX_CONFIG_FILE" 2>/dev/null)
+            if [[ "$api_key" == "$OPENAI_API_KEY" && "$base_url" == "$OPENAI_BASE_URL" ]]; then
+                CURRENT_CODEX_CONFIG=$(jq -r ".configs[$i].name" "$CODEX_CONFIG_FILE" 2>/dev/null)
+                break
+            fi
+        done
+    fi
 
-# 选择AI类型
-echo "=========================================="
-echo "AI 配置切换工具"
-echo "=========================================="
-echo ""
-echo "请选择 AI 类型:"
-echo "1) Claude (当前: $CURRENT_CLAUDE_CONFIG)"
-echo "2) Codex (OpenAI) (当前: $CURRENT_CODEX_CONFIG)"
-echo ""
-read -p "选择 [1/2]: " ai_choice
+    # 选择AI类型
+    clear
+    echo "=========================================="
+    echo "AI 配置切换工具"
+    echo "=========================================="
+    echo ""
+    echo "请选择 AI 类型:"
+    echo "1) Claude (当前: $CURRENT_CLAUDE_CONFIG)"
+    echo "2) Codex (OpenAI) (当前: $CURRENT_CODEX_CONFIG)"
+    echo ""
+    read -p "选择 [1/2]: " ai_choice
 
-# 根据选择设置配置文件和环境变量类型
-if [ "$ai_choice" = "1" ]; then
-    AI_TYPE="claude"
-    CONFIG_FILE="$(dirname "$0")/claude_configs.json"
-    ENV_TOKEN_NAME="ANTHROPIC_AUTH_TOKEN"
-    ENV_URL_NAME="ANTHROPIC_BASE_URL"
-    DISPLAY_NAME="Claude"
-elif [ "$ai_choice" = "2" ]; then
-    AI_TYPE="codex"
-    CONFIG_FILE="$(dirname "$0")/codex_configs.json"
-    ENV_TOKEN_NAME="OPENAI_API_KEY"
-    ENV_URL_NAME="OPENAI_BASE_URL"
-    DISPLAY_NAME="Codex"
-else
-    echo "[Error] 无效选择"
-    exit 1
-fi
+    # 根据选择设置配置文件和环境变量类型
+    if [ "$ai_choice" = "1" ]; then
+        AI_TYPE="claude"
+        CONFIG_FILE="$(dirname "$0")/claude_configs.json"
+        ENV_TOKEN_NAME="ANTHROPIC_AUTH_TOKEN"
+        ENV_URL_NAME="ANTHROPIC_BASE_URL"
+        DISPLAY_NAME="Claude"
+    elif [ "$ai_choice" = "2" ]; then
+        AI_TYPE="codex"
+        CONFIG_FILE="$(dirname "$0")/codex_configs.json"
+        ENV_TOKEN_NAME="OPENAI_API_KEY"
+        ENV_URL_NAME="OPENAI_BASE_URL"
+        DISPLAY_NAME="Codex"
+    else
+        echo "[Error] 无效选择"
+        continue
+    fi
 
 clear
 
@@ -661,126 +809,6 @@ if [[ -n "$CURRENT_TOKEN" && -n "$CURRENT_URL" ]]; then
         fi
     done
 fi
-
-# 获取健康检查状态（实时拉取，不使用缓存）
-# 注意：这个函数现在不再使用，因为我们在脚本开始时就已经拉取了
-# 保留此函数是为了兼容其他可能调用的地方
-fetch_health_status() {
-    echo -e "${GRAY}正在拉取渠道状态...${RESET}" >&2
-    local response=$(curl -s "$HEALTH_CHECK_URL" 2>/dev/null)
-    if [[ $? -eq 0 && -n "$response" ]]; then
-        echo "$response"
-    else
-        echo '{"services":{}}'
-    fi
-}
-
-# 函数：格式化时间显示为"xx分钟前"（处理UTC时间）
-format_time_ago() {
-    local utc_time="$1"
-    if [[ -z "$utc_time" || "$utc_time" == "null" || "$utc_time" == "" ]]; then
-        echo ""
-        return
-    fi
-    
-    # 检查是否有date命令
-    if ! command -v date &> /dev/null; then
-        echo "$(echo "$utc_time" | cut -d'T' -f2 | cut -d'.' -f1)"
-        return
-    fi
-    
-    # 解析UTC时间字符串（格式：2025-10-30T09:30:06.294Z）
-    local date_part=$(echo "$utc_time" | cut -d'T' -f1)
-    local time_part=$(echo "$utc_time" | cut -d'T' -f2 | cut -d'.' -f1 | cut -d'Z' -f1)
-    
-    # macOS date命令
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        # 提取年月日时分秒
-        local year=$(echo "$date_part" | cut -d'-' -f1)
-        local month=$(echo "$date_part" | cut -d'-' -f2)
-        local day=$(echo "$date_part" | cut -d'-' -f3)
-        local hour=$(echo "$time_part" | cut -d':' -f1)
-        local minute=$(echo "$time_part" | cut -d':' -f2)
-        local second=$(echo "$time_part" | cut -d':' -f3)
-        
-        # 转换为Unix时间戳（UTC）
-        local utc_timestamp=$(date -u -j -f "%Y-%m-%d %H:%M:%S" "${year}-${month}-${day} ${hour}:${minute}:${second}" "+%s" 2>/dev/null)
-        
-        if [[ -n "$utc_timestamp" ]]; then
-            local current_timestamp=$(date +%s)
-            local diff_seconds=$((current_timestamp - utc_timestamp))
-            
-            if [[ $diff_seconds -lt 0 ]]; then
-                echo "刚刚"
-                return
-            fi
-            
-            local diff_minutes=$((diff_seconds / 60))
-            
-            if [[ $diff_minutes -lt 1 ]]; then
-                echo "刚刚"
-            elif [[ $diff_minutes -lt 60 ]]; then
-                echo "${diff_minutes}分钟前"
-            else
-                local diff_hours=$((diff_minutes / 60))
-                if [[ $diff_hours -lt 24 ]]; then
-                    echo "${diff_hours}小时前"
-                else
-                    local diff_days=$((diff_hours / 24))
-                    echo "${diff_days}天前"
-                fi
-            fi
-        else
-            echo "$time_part"
-        fi
-    else
-        # Linux date命令（GNU date）
-        local utc_timestamp=$(date -d "$utc_time" +%s 2>/dev/null)
-        
-        if [[ -n "$utc_timestamp" ]]; then
-            local current_timestamp=$(date +%s)
-            local diff_seconds=$((current_timestamp - utc_timestamp))
-            
-            if [[ $diff_seconds -lt 0 ]]; then
-                echo "刚刚"
-                return
-            fi
-            
-            local diff_minutes=$((diff_seconds / 60))
-            
-            if [[ $diff_minutes -lt 1 ]]; then
-                echo "刚刚"
-            elif [[ $diff_minutes -lt 60 ]]; then
-                echo "${diff_minutes}分钟前"
-            else
-                local diff_hours=$((diff_minutes / 60))
-                if [[ $diff_hours -lt 24 ]]; then
-                    echo "${diff_hours}小时前"
-                else
-                    local diff_days=$((diff_hours / 24))
-                    echo "${diff_days}天前"
-                fi
-            fi
-        else
-            echo "$time_part"
-        fi
-    fi
-}
-
-# 函数：根据channel_id获取服务状态和lastCheck时间（从已拉取的数据中）
-get_channel_info_from_data() {
-    local channel_id="$1"
-    local health_data="$2"
-    
-    local status=$(echo "$health_data" | jq -r ".services.\"$channel_id\".status // \"unknown\"" 2>/dev/null)
-    local last_check=$(echo "$health_data" | jq -r ".services.\"$channel_id\".lastCheck // \"\"" 2>/dev/null)
-    
-    if [[ "$status" == "null" || "$status" == "" ]]; then
-        echo "unknown||"
-    else
-        echo "$status|$last_check|"
-    fi
-}
 
 # 将配置信息写入临时文件，包含索引信息
 for ((i=0; i<config_count; i++)); do
@@ -906,8 +934,15 @@ else
     echo "当前设置：未配置"
 fi
 echo "=========================================="
+echo "0) 返回AI类型选择"
+echo ""
 
 read -p "#? " choice
+
+# 如果输入0，返回AI类型选择
+if [[ "$choice" == "0" ]]; then
+    continue
+fi
 
 if [[ -z "$FORCE_PERMANENT" ]]; then
     echo ""
@@ -936,7 +971,7 @@ if [[ $choice -ge 1 && $choice -le $((line_num-1)) ]]; then
     fi
 else
     echo "[Error] 无效选择"
-    exit 1
+    continue
 fi
 
 if [ "$mode" = "1" ]; then
@@ -945,6 +980,7 @@ if [ "$mode" = "1" ]; then
     export "$ENV_URL_NAME=$BASE_URL"
     echo "已切换到: $CONFIG_NAME (临时设置)"
     echo "仅在当前终端会话中有效"
+    break
 elif [ "$mode" = "2" ]; then
     # 永久设置
     # 检测当前shell类型
@@ -976,7 +1012,9 @@ elif [ "$mode" = "2" ]; then
 
     # 3. 最后，一次性打印所有输出
     echo "$output_message"
+    break
 else
     echo "[Error] 无效的设置方式选择"
-    exit 1
+    continue
 fi
+done
