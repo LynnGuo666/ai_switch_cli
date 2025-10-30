@@ -25,6 +25,46 @@ HEALTH_CHECK_URL="https://check-cx.59188888.xyz/health"
 HEALTH_CHECK_CACHE_FILE="/tmp/ai_health_check_cache.json"
 HEALTH_CHECK_CACHE_TTL=60  # 缓存60秒
 
+# 颜色定义
+if [[ -t 1 ]]; then
+    # 支持颜色输出
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    GOLD='\033[0;33m'
+    BLUE='\033[0;34m'
+    CYAN='\033[0;36m'
+    GRAY='\033[0;90m'
+    WHITE='\033[0;37m'
+    BOLD='\033[1m'
+    RESET='\033[0m'
+    # 状态图标和颜色
+    STATUS_OK="${GREEN}●${RESET}"
+    STATUS_ERROR="${RED}●${RESET}"
+    STATUS_UNKNOWN="${GRAY}○${RESET}"
+    STATUS_OK_TEXT="${GREEN}正常${RESET}"
+    STATUS_ERROR_TEXT="${RED}错误${RESET}"
+    STATUS_UNKNOWN_TEXT="${GRAY}未知${RESET}"
+else
+    # 不支持颜色输出（非终端）
+    RED=''
+    GREEN=''
+    YELLOW=''
+    GOLD=''
+    BLUE=''
+    CYAN=''
+    GRAY=''
+    WHITE=''
+    BOLD=''
+    RESET=''
+    STATUS_OK="🟢"
+    STATUS_ERROR="🔴"
+    STATUS_UNKNOWN="⚪"
+    STATUS_OK_TEXT="正常"
+    STATUS_ERROR_TEXT="错误"
+    STATUS_UNKNOWN_TEXT="未知"
+fi
+
 # 函数：获取健康检查状态
 fetch_health_status() {
     local cache_age=999999
@@ -307,38 +347,43 @@ list_configs() {
         return
     fi
     
-    echo "配置列表 ($ai_type):"
+    echo -e "${BOLD}配置列表 ($ai_type):${RESET}"
     echo "=========================================="
     
     for ((i=0; i<config_count; i++)); do
         local name=$(jq -r ".configs[$i].name" "$config_file")
         local channel_id=$(jq -r ".configs[$i].channel_id // \"\"" "$config_file")
         local status=""
+        local status_icon=""
         
         if [[ -n "$channel_id" && "$channel_id" != "null" && "$channel_id" != "" ]]; then
             status=$(get_channel_status "$channel_id")
             if [[ "$status" == "ok" ]]; then
-                status="🟢 正常"
+                status_icon="$STATUS_OK"
+                status="$STATUS_OK_TEXT"
             elif [[ "$status" == "error" ]]; then
-                status="🔴 错误"
+                status_icon="$STATUS_ERROR"
+                status="$STATUS_ERROR_TEXT"
             else
-                status="⚪ 未知"
+                status_icon="$STATUS_UNKNOWN"
+                status="$STATUS_UNKNOWN_TEXT"
             fi
         else
-            status="⚪ 未配置"
+            status_icon="$STATUS_UNKNOWN"
+            status="$STATUS_UNKNOWN_TEXT (未配置)"
         fi
         
-        echo "[$i] $name"
+        echo -e "${BOLD}[$i]${RESET} $status_icon ${CYAN}$name${RESET}"
         if [[ -n "$channel_id" && "$channel_id" != "null" && "$channel_id" != "" ]]; then
-            echo "    渠道ID: $channel_id | 状态: $status"
+            echo -e "    ${GRAY}渠道ID:${RESET} ${CYAN}$channel_id${RESET} ${GRAY}|${RESET} ${GRAY}状态:${RESET} $status"
         fi
         
         if [[ "$ai_type" == "claude" ]]; then
             local url=$(jq -r ".configs[$i].url" "$config_file")
-            echo "    URL: $url"
+            echo -e "    ${GRAY}URL:${RESET} $url"
         else
             local base_url=$(jq -r ".configs[$i].base_url" "$config_file")
-            echo "    Base URL: $base_url"
+            echo -e "    ${GRAY}Base URL:${RESET} $base_url"
         fi
         echo ""
     done
@@ -346,14 +391,14 @@ list_configs() {
 
 # 函数：显示所有渠道状态
 show_status() {
-    echo "渠道状态检查"
+    echo -e "${BOLD}渠道状态检查${RESET}"
     echo "=========================================="
     
     local health_data=$(fetch_health_status)
     local services=$(echo "$health_data" | jq -r '.services | keys[]' 2>/dev/null)
     
     if [[ -z "$services" ]]; then
-        echo "[Warning] 无法获取渠道状态"
+        echo -e "${YELLOW}[Warning] 无法获取渠道状态${RESET}"
         return
     fi
     
@@ -362,16 +407,16 @@ show_status() {
         local status_part=$(echo "$line" | cut -d':' -f2-)
         
         if echo "$status_part" | grep -q "ok"; then
-            echo "🟢 $channel_id - $status_part"
+            echo -e "$STATUS_OK ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} $status_part"
         elif echo "$status_part" | grep -q "error"; then
-            echo "🔴 $channel_id - $status_part"
+            echo -e "$STATUS_ERROR ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} $status_part"
         else
-            echo "⚪ $channel_id - $status_part"
+            echo -e "$STATUS_UNKNOWN ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} $status_part"
         fi
     done
     
     echo ""
-    echo "配置中的渠道匹配:"
+    echo -e "${BOLD}配置中的渠道匹配:${RESET}"
     echo "----------------------------------------"
     
     # 检查Claude配置
@@ -383,11 +428,11 @@ show_status() {
             if [[ -n "$channel_id" && "$channel_id" != "null" && "$channel_id" != "" ]]; then
                 local status=$(get_channel_status "$channel_id")
                 if [[ "$status" == "ok" ]]; then
-                    echo "🟢 Claude: $name ($channel_id)"
+                    echo -e "$STATUS_OK ${BOLD}Claude:${RESET} ${CYAN}$name${RESET} ${GRAY}($channel_id)${RESET}"
                 elif [[ "$status" == "error" ]]; then
-                    echo "🔴 Claude: $name ($channel_id)"
+                    echo -e "$STATUS_ERROR ${BOLD}Claude:${RESET} ${CYAN}$name${RESET} ${GRAY}($channel_id)${RESET}"
                 else
-                    echo "⚪ Claude: $name ($channel_id) - 未找到"
+                    echo -e "$STATUS_UNKNOWN ${BOLD}Claude:${RESET} ${CYAN}$name${RESET} ${GRAY}($channel_id)${RESET} ${GRAY}- 未找到${RESET}"
                 fi
             fi
         done
@@ -402,11 +447,11 @@ show_status() {
             if [[ -n "$channel_id" && "$channel_id" != "null" && "$channel_id" != "" ]]; then
                 local status=$(get_channel_status "$channel_id")
                 if [[ "$status" == "ok" ]]; then
-                    echo "🟢 Codex: $name ($channel_id)"
+                    echo -e "$STATUS_OK ${BOLD}Codex:${RESET} ${CYAN}$name${RESET} ${GRAY}($channel_id)${RESET}"
                 elif [[ "$status" == "error" ]]; then
-                    echo "🔴 Codex: $name ($channel_id)"
+                    echo -e "$STATUS_ERROR ${BOLD}Codex:${RESET} ${CYAN}$name${RESET} ${GRAY}($channel_id)${RESET}"
                 else
-                    echo "⚪ Codex: $name ($channel_id) - 未找到"
+                    echo -e "$STATUS_UNKNOWN ${BOLD}Codex:${RESET} ${CYAN}$name${RESET} ${GRAY}($channel_id)${RESET} ${GRAY}- 未找到${RESET}"
                 fi
             fi
         done
@@ -573,6 +618,33 @@ temp_file=$(mktemp)
 # 获取健康检查状态
 health_data=$(fetch_health_status)
 
+# 获取当前配置名称（用于高亮显示）
+current_config_name=""
+# 根据AI类型检查不同的环境变量
+if [ "$AI_TYPE" = "claude" ]; then
+    CURRENT_TOKEN="$ANTHROPIC_AUTH_TOKEN"
+    CURRENT_URL="$ANTHROPIC_BASE_URL"
+    TOKEN_FIELD="token"
+    URL_FIELD="url"
+else
+    CURRENT_TOKEN="$OPENAI_API_KEY"
+    CURRENT_URL="$OPENAI_BASE_URL"
+    TOKEN_FIELD="api_key"
+    URL_FIELD="base_url"
+fi
+
+if [[ -n "$CURRENT_TOKEN" && -n "$CURRENT_URL" ]]; then
+    config_count_check=$(jq '.configs | length' "$CONFIG_FILE")
+    for ((i=0; i<config_count_check; i++)); do
+        token=$(jq -r ".configs[$i].$TOKEN_FIELD" "$CONFIG_FILE")
+        url=$(jq -r ".configs[$i].$URL_FIELD" "$CONFIG_FILE")
+        if [[ "$token" == "$CURRENT_TOKEN" && "$url" == "$CURRENT_URL" ]]; then
+            current_config_name=$(jq -r ".configs[$i].name" "$CONFIG_FILE")
+            break
+        fi
+    done
+fi
+
 # 将配置信息写入临时文件，包含索引信息
 for ((i=0; i<config_count; i++)); do
     name=$(jq -r ".configs[$i].name" "$CONFIG_FILE")
@@ -583,15 +655,23 @@ for ((i=0; i<config_count; i++)); do
     
     # 获取渠道状态
     status_icon=""
+    status_color=""
     if [[ -n "$channel_id" && "$channel_id" != "null" && "$channel_id" != "" ]]; then
         status=$(get_channel_status "$channel_id")
         if [[ "$status" == "ok" ]]; then
-            status_icon="🟢"
+            status_icon="$STATUS_OK"
+            status_color="ok"
         elif [[ "$status" == "error" ]]; then
-            status_icon="🔴"
+            status_icon="$STATUS_ERROR"
+            status_color="error"
         else
-            status_icon="⚪"
+            status_icon="$STATUS_UNKNOWN"
+            status_color="unknown"
         fi
+    else
+        # 没有channel_id时，使用灰色点
+        status_icon="$STATUS_UNKNOWN"
+        status_color=""
     fi
     
     # 提取价格数字用于排序（处理 ¥0.9/1M tokens 或 $3/1M tokens 格式）
@@ -613,7 +693,7 @@ for ((i=0; i<config_count; i++)); do
     # 计算总价格（输入+输出）
     total_price=$(echo "$input_num + $output_num" | bc -l 2>/dev/null || echo "0")
     
-    echo "$i|$name|$input_price|$output_price|$description|$total_price|$status_icon|$channel_id" >> "$temp_file"
+    echo "$i|$name|$input_price|$output_price|$description|$total_price|$status_icon|$channel_id|$status_color" >> "$temp_file"
 done
 
     # 按总价格排序（从低到高）
@@ -626,9 +706,19 @@ done
 
 # 显示排序后的配置
 line_num=1
-while IFS='|' read -r index name input_price output_price description total_price status_icon channel_id; do
-    echo "$line_num) $status_icon $name"
-    echo "    输入: $input_price | 输出: $output_price"
+while IFS='|' read -r index name input_price output_price description total_price status_icon channel_id status_color; do
+    # 判断是否是当前配置
+    if [[ "$name" == "$current_config_name" ]]; then
+        name_color="${GOLD}"
+    else
+        name_color="${WHITE}"
+    fi
+    
+    # 显示配置名称（前面始终有点，有状态用对应颜色，无状态用灰色）
+    echo -e "${BOLD}$line_num)${RESET} $status_icon ${name_color}$name${RESET}"
+    
+    # 显示价格信息（全部改为灰色）
+    echo -e "    ${GRAY}输入: $input_price | 输出: $output_price${RESET}"
     
     # 计算并显示转换后的人民币价格
     input_num=$(echo "$input_price" | grep -o '[0-9]*\.\?[0-9]*' | head -1)
@@ -640,24 +730,12 @@ while IFS='|' read -r index name input_price output_price description total_pric
     if [[ "$input_price" == *"$"* ]]; then
         input_cny=$(echo "$input_num * 7" | bc -l 2>/dev/null || echo "$input_num")
         output_cny=$(echo "$output_num * 7" | bc -l 2>/dev/null || echo "$output_num")
-        echo "    (约 ¥${input_cny}/1M tokens | ¥${output_cny}/1M tokens)"
+        echo -e "    ${GRAY}(约 ¥${input_cny}/1M tokens | ¥${output_cny}/1M tokens)${RESET}"
     fi
     
-    # 显示渠道状态
-    if [[ -n "$channel_id" && "$channel_id" != "null" && "$channel_id" != "" ]]; then
-        status=$(get_channel_status "$channel_id")
-        if [[ "$status" == "ok" ]]; then
-            echo "    渠道状态: 🟢 正常 ($channel_id)"
-        elif [[ "$status" == "error" ]]; then
-            echo "    渠道状态: 🔴 错误 ($channel_id)"
-        else
-            echo "    渠道状态: ⚪ 未知 ($channel_id)"
-        fi
-    fi
-    
-    # 只有当描述不为空且不是null时才显示
+    # 只有当描述不为空且不是null时才显示（改为灰色）
     if [[ -n "$description" && "$description" != "null" ]]; then
-        echo "    $description"
+        echo -e "    ${GRAY}$description${RESET}"
     fi
     echo ""
     
@@ -669,33 +747,6 @@ done < "$temp_file"
 
 # 清理临时文件
 rm -f "$temp_file"
-
-# 获取当前配置名称
-current_config_name=""
-# 根据AI类型检查不同的环境变量
-if [ "$AI_TYPE" = "claude" ]; then
-    CURRENT_TOKEN="$ANTHROPIC_AUTH_TOKEN"
-    CURRENT_URL="$ANTHROPIC_BASE_URL"
-    TOKEN_FIELD="token"
-    URL_FIELD="url"
-else
-    CURRENT_TOKEN="$OPENAI_API_KEY"
-    CURRENT_URL="$OPENAI_BASE_URL"
-    TOKEN_FIELD="api_key"
-    URL_FIELD="base_url"
-fi
-
-if [[ -n "$CURRENT_TOKEN" && -n "$CURRENT_URL" ]]; then
-    config_count=$(jq '.configs | length' "$CONFIG_FILE")
-    for ((i=0; i<config_count; i++)); do
-        token=$(jq -r ".configs[$i].$TOKEN_FIELD" "$CONFIG_FILE")
-        url=$(jq -r ".configs[$i].$URL_FIELD" "$CONFIG_FILE")
-        if [[ "$token" == "$CURRENT_TOKEN" && "$url" == "$CURRENT_URL" ]]; then
-            current_config_name=$(jq -r ".configs[$i].name" "$CONFIG_FILE")
-            break
-        fi
-    done
-fi
 
 # 在列表末尾显示当前设置
 if [[ -n "$current_config_name" ]]; then
