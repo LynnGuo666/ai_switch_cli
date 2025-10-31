@@ -267,6 +267,65 @@ show_help() {
     echo "  $0 --status          # 显示渠道状态"
 }
 
+# 函数：从 .codex/config.toml 读取当前节点信息
+get_current_codex_node() {
+    local codex_config_dir="$(dirname "$0")/.codex"
+    local config_toml="$codex_config_dir/config.toml"
+    
+    if [[ ! -f "$config_toml" ]]; then
+        echo ""
+        return
+    fi
+    
+    # 读取 model_provider 字段（如果存在）
+    # 使用 grep 和 sed 来解析 TOML 文件
+    # 处理 model_provider = "anyrouter" 或 model_provider = anyrouter
+    local model_provider=$(grep -E "^model_provider\s*=" "$config_toml" 2>/dev/null | sed -E 's/^model_provider\s*=\s*"([^"]+)".*/\1/' | sed -E 's/^model_provider\s*=\s*([^[:space:]]+).*/\1/')
+    
+    if [[ -n "$model_provider" && "$model_provider" != "null" ]]; then
+        echo "$model_provider"
+    else
+        # 如果没有 model_provider，尝试从 [model_providers.*] 部分读取
+        local provider_name=$(grep -E "^\[model_providers\." "$config_toml" 2>/dev/null | sed -E 's/^\[model_providers\.([^]]+)\].*/\1/')
+        if [[ -n "$provider_name" && "$provider_name" != "null" ]]; then
+            echo "$provider_name"
+        else
+            echo ""
+        fi
+    fi
+}
+
+# 函数：复制 codex 配置文件到 .codex/ 文件夹
+copy_codex_configs() {
+    local config_folder="$1"
+    local script_dir="$(dirname "$0")"
+    local codex_source_dir="$script_dir/codex/$config_folder"
+    local codex_target_dir="$script_dir/.codex"
+    
+    # 检查源文件夹是否存在
+    if [[ ! -d "$codex_source_dir" ]]; then
+        return 1
+    fi
+    
+    # 创建目标文件夹（如果不存在）
+    mkdir -p "$codex_target_dir"
+    
+    # 复制 config.toml 和 auth.json
+    if [[ -f "$codex_source_dir/config.toml" ]]; then
+        cp "$codex_source_dir/config.toml" "$codex_target_dir/config.toml"
+    else
+        return 1
+    fi
+    
+    if [[ -f "$codex_source_dir/auth.json" ]]; then
+        cp "$codex_source_dir/auth.json" "$codex_target_dir/auth.json"
+    else
+        return 1
+    fi
+    
+    return 0
+}
+
 # 函数：初始化配置文件
 init_config_file() {
     local config_file="$1"
@@ -763,7 +822,35 @@ while true; do
 
     # 获取当前Codex配置
     CURRENT_CODEX_CONFIG="未配置"
-    if [[ $CODEX_CONFIG_EXISTS == true && -n "$OPENAI_API_KEY" && -n "$OPENAI_BASE_URL" ]]; then
+    # 优先从 .codex/config.toml 读取当前节点
+    current_node=$(get_current_codex_node)
+    
+    if [[ -n "$current_node" && $CODEX_CONFIG_EXISTS == true ]]; then
+        # 根据节点名称匹配配置
+        # 首先尝试通过配置中的 codex_folder 字段匹配
+        config_count=$(jq '.configs | length' "$CODEX_CONFIG_FILE" 2>/dev/null || echo "0")
+        for ((i=0; i<config_count; i++)); do
+            codex_folder=$(jq -r ".configs[$i].codex_folder // \"\"" "$CODEX_CONFIG_FILE" 2>/dev/null)
+            if [[ "$codex_folder" == "$current_node" ]]; then
+                CURRENT_CODEX_CONFIG=$(jq -r ".configs[$i].name" "$CODEX_CONFIG_FILE" 2>/dev/null)
+                break
+            fi
+        done
+        
+        # 如果没有匹配到，尝试通过环境变量匹配（向后兼容）
+        if [[ "$CURRENT_CODEX_CONFIG" == "未配置" && -n "$OPENAI_API_KEY" && -n "$OPENAI_BASE_URL" ]]; then
+            config_count=$(jq '.configs | length' "$CODEX_CONFIG_FILE" 2>/dev/null || echo "0")
+            for ((i=0; i<config_count; i++)); do
+                api_key=$(jq -r ".configs[$i].api_key" "$CODEX_CONFIG_FILE" 2>/dev/null)
+                base_url=$(jq -r ".configs[$i].base_url" "$CODEX_CONFIG_FILE" 2>/dev/null)
+                if [[ "$api_key" == "$OPENAI_API_KEY" && "$base_url" == "$OPENAI_BASE_URL" ]]; then
+                    CURRENT_CODEX_CONFIG=$(jq -r ".configs[$i].name" "$CODEX_CONFIG_FILE" 2>/dev/null)
+                    break
+                fi
+            done
+        fi
+    elif [[ $CODEX_CONFIG_EXISTS == true && -n "$OPENAI_API_KEY" && -n "$OPENAI_BASE_URL" ]]; then
+        # 如果没有 .codex/config.toml，使用环境变量匹配（向后兼容）
         config_count=$(jq '.configs | length' "$CODEX_CONFIG_FILE" 2>/dev/null || echo "0")
         for ((i=0; i<config_count; i++)); do
             api_key=$(jq -r ".configs[$i].api_key" "$CODEX_CONFIG_FILE" 2>/dev/null)
@@ -1029,6 +1116,12 @@ if [[ $choice -ge 1 && $choice -le $((line_num-1)) ]]; then
     else
         TOKEN=$(jq -r ".configs[$index].api_key" "$CONFIG_FILE")
         BASE_URL=$(jq -r ".configs[$index].base_url" "$CONFIG_FILE")
+        
+        # 如果是 Codex 配置，检查是否有 codex_folder 字段，如果有则复制配置文件
+        codex_folder=$(jq -r ".configs[$index].codex_folder // \"\"" "$CONFIG_FILE")
+        if [[ -n "$codex_folder" && "$codex_folder" != "null" && "$codex_folder" != "" ]]; then
+            copy_codex_configs "$codex_folder" >/dev/null 2>&1 || true
+        fi
     fi
 else
     echo "[Error] 无效选择"
