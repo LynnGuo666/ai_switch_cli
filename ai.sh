@@ -249,7 +249,7 @@ get_channel_status() {
 
 # 函数：显示帮助信息
 show_help() {
-    echo "AI 配置管理工具 v1.7.0"
+    echo "AI 配置管理工具 v1.8.0"
     echo ""
     echo "用法:"
     echo "  $0                    # 交互式配置切换"
@@ -913,7 +913,7 @@ else
     echo ""
     TEMP_SETTING_AVAILABLE=true
 fi
-echo "作者：Lynn v1.7.0"
+echo "作者：Lynn v1.8.0"
 echo "=========================================="
 
 # 读取配置文件并显示选项
@@ -1113,14 +1113,20 @@ if [[ $choice -ge 1 && $choice -le $((line_num-1)) ]]; then
     if [ "$AI_TYPE" = "claude" ]; then
         TOKEN=$(jq -r ".configs[$index].token" "$CONFIG_FILE")
         BASE_URL=$(jq -r ".configs[$index].url" "$CONFIG_FILE")
+        USE_CODEX_FOLDER=false
     else
         TOKEN=$(jq -r ".configs[$index].api_key" "$CONFIG_FILE")
         BASE_URL=$(jq -r ".configs[$index].base_url" "$CONFIG_FILE")
         
-        # 如果是 Codex 配置，检查是否有 codex_folder 字段，如果有则复制配置文件
+        # 如果是 Codex 配置，检查是否有 codex_folder 字段
         codex_folder=$(jq -r ".configs[$index].codex_folder // \"\"" "$CONFIG_FILE")
         if [[ -n "$codex_folder" && "$codex_folder" != "null" && "$codex_folder" != "" ]]; then
+            # 如果有 codex_folder，复制配置文件到 .codex/，但不设置环境变量
             copy_codex_configs "$codex_folder" >/dev/null 2>&1 || true
+            # 标记为使用文件夹配置，跳过环境变量设置
+            USE_CODEX_FOLDER=true
+        else
+            USE_CODEX_FOLDER=false
         fi
     fi
 else
@@ -1130,22 +1136,35 @@ fi
 
 if [ "$mode" = "1" ]; then
     # 临时设置
-    export "$ENV_TOKEN_NAME=$TOKEN"
-    export "$ENV_URL_NAME=$BASE_URL"
-    echo "已切换到: $CONFIG_NAME (临时设置)"
-    echo "仅在当前终端会话中有效"
+    if [[ "$AI_TYPE" == "codex" && "$USE_CODEX_FOLDER" == "true" ]]; then
+        # 如果使用 codex_folder，只复制配置文件，不设置环境变量
+        echo "已切换到: $CONFIG_NAME (临时设置)"
+        echo "配置文件已复制到 .codex/ 文件夹"
+        echo "仅在当前终端会话中有效"
+    else
+        # 其他情况正常设置环境变量
+        export "$ENV_TOKEN_NAME=$TOKEN"
+        export "$ENV_URL_NAME=$BASE_URL"
+        echo "已切换到: $CONFIG_NAME (临时设置)"
+        echo "仅在当前终端会话中有效"
+    fi
     break
 elif [ "$mode" = "2" ]; then
     # 永久设置
-    # 检测当前shell类型
-    if [ -n "$ZSH_VERSION" ] || [ "$SHELL" = "/bin/zsh" ] || [ "$SHELL" = "/usr/bin/zsh" ]; then
-        SHELL_CONFIG_FILE="$HOME/.zshrc"
+    if [[ "$AI_TYPE" == "codex" && "$USE_CODEX_FOLDER" == "true" ]]; then
+        # 如果使用 codex_folder，只复制配置文件，不设置环境变量
+        echo "已切换到: $CONFIG_NAME (永久设置)"
+        echo "配置文件已复制到 .codex/ 文件夹"
     else
-        SHELL_CONFIG_FILE="$HOME/.bash_profile"
-    fi
+        # 检测当前shell类型
+        if [ -n "$ZSH_VERSION" ] || [ "$SHELL" = "/bin/zsh" ] || [ "$SHELL" = "/usr/bin/zsh" ]; then
+            SHELL_CONFIG_FILE="$HOME/.zshrc"
+        else
+            SHELL_CONFIG_FILE="$HOME/.bash_profile"
+        fi
 
-    # 1. 先在内存中准备好要输出的内容
-    output_message="切换配置任务清单:
+        # 1. 先在内存中准备好要输出的内容
+        output_message="切换配置任务清单:
 ■ 配置已写入: $SHELL_CONFIG_FILE
 □ 刷新配置生效
 □ 请手动执行以下命令以刷新配置：
@@ -1153,19 +1172,20 @@ elif [ "$mode" = "2" ]; then
 
 ✓ 已切换到: $CONFIG_NAME (永久设置)"
 
-    # 2. 执行文件写入操作
-    # 移除旧的配置（如果存在）
-    grep -v "$ENV_TOKEN_NAME=" "$SHELL_CONFIG_FILE" > "$SHELL_CONFIG_FILE.tmp" 2>/dev/null || touch "$SHELL_CONFIG_FILE.tmp"
-    grep -v "$ENV_URL_NAME=" "$SHELL_CONFIG_FILE.tmp" > "$SHELL_CONFIG_FILE.tmp2"
-    mv "$SHELL_CONFIG_FILE.tmp2" "$SHELL_CONFIG_FILE"
-    rm -f "$SHELL_CONFIG_FILE.tmp"
-    
-    # 添加新配置
-    echo "export $ENV_TOKEN_NAME=\"$TOKEN\"" >> "$SHELL_CONFIG_FILE"
-    echo "export $ENV_URL_NAME=\"$BASE_URL\"" >> "$SHELL_CONFIG_FILE"
+        # 2. 执行文件写入操作
+        # 移除旧的配置（如果存在）
+        grep -v "$ENV_TOKEN_NAME=" "$SHELL_CONFIG_FILE" > "$SHELL_CONFIG_FILE.tmp" 2>/dev/null || touch "$SHELL_CONFIG_FILE.tmp"
+        grep -v "$ENV_URL_NAME=" "$SHELL_CONFIG_FILE.tmp" > "$SHELL_CONFIG_FILE.tmp2"
+        mv "$SHELL_CONFIG_FILE.tmp2" "$SHELL_CONFIG_FILE"
+        rm -f "$SHELL_CONFIG_FILE.tmp"
+        
+        # 添加新配置
+        echo "export $ENV_TOKEN_NAME=\"$TOKEN\"" >> "$SHELL_CONFIG_FILE"
+        echo "export $ENV_URL_NAME=\"$BASE_URL\"" >> "$SHELL_CONFIG_FILE"
 
-    # 3. 最后，一次性打印所有输出
-    echo "$output_message"
+        # 3. 最后，一次性打印所有输出
+        echo "$output_message"
+    fi
     break
 else
     echo "[Error] 无效的设置方式选择"
