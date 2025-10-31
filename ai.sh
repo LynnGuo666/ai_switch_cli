@@ -44,9 +44,11 @@ if [[ -t 1 ]]; then
     # 状态图标和颜色
     STATUS_OK="${GREEN}●${RESET}"
     STATUS_ERROR="${RED}●${RESET}"
+    STATUS_TIMEOUT="${YELLOW}●${RESET}"
     STATUS_UNKNOWN="${GRAY}○${RESET}"
     STATUS_OK_TEXT="${GREEN}正常${RESET}"
     STATUS_ERROR_TEXT="${RED}错误${RESET}"
+    STATUS_TIMEOUT_TEXT="${YELLOW}超时${RESET}"
     STATUS_UNKNOWN_TEXT="${GRAY}未知${RESET}"
 else
     # 不支持颜色输出（非终端）
@@ -62,9 +64,11 @@ else
     RESET=''
     STATUS_OK="🟢"
     STATUS_ERROR="🔴"
+    STATUS_TIMEOUT="🟡"
     STATUS_UNKNOWN="⚪"
     STATUS_OK_TEXT="正常"
     STATUS_ERROR_TEXT="错误"
+    STATUS_TIMEOUT_TEXT="超时"
     STATUS_UNKNOWN_TEXT="未知"
 fi
 
@@ -512,6 +516,9 @@ list_configs() {
             elif [[ "$status_val" == "error" ]]; then
                 status_icon="$STATUS_ERROR"
                 status="$STATUS_ERROR_TEXT"
+            elif [[ "$status_val" == "timeout" ]]; then
+                status_icon="$STATUS_TIMEOUT"
+                status="$STATUS_TIMEOUT_TEXT"
             else
                 status_icon="$STATUS_UNKNOWN"
                 status="$STATUS_UNKNOWN_TEXT"
@@ -577,6 +584,12 @@ show_status() {
             else
                 echo -e "$STATUS_ERROR ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} ${RED}error${RESET}"
             fi
+        elif [[ "$status_val" == "timeout" ]]; then
+            if [[ -n "$time_ago" ]]; then
+                echo -e "$STATUS_TIMEOUT ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} ${YELLOW}timeout${RESET} ${GRAY}($time_ago)${RESET}"
+            else
+                echo -e "$STATUS_TIMEOUT ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} ${YELLOW}timeout${RESET}"
+            fi
         else
             if [[ -n "$time_ago" ]]; then
                 echo -e "$STATUS_UNKNOWN ${CYAN}$channel_id${RESET} ${GRAY}-${RESET} ${GRAY}unknown${RESET} ${GRAY}($time_ago)${RESET}"
@@ -614,6 +627,12 @@ show_status() {
                     else
                         echo -e "$STATUS_ERROR ${BOLD}Claude:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET}"
                     fi
+                elif [[ "$status" == "timeout" ]]; then
+                    if [[ -n "$time_ago" ]]; then
+                        echo -e "$STATUS_TIMEOUT ${BOLD}Claude:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET} ${GRAY}($time_ago)${RESET}"
+                    else
+                        echo -e "$STATUS_TIMEOUT ${BOLD}Claude:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET}"
+                    fi
                 else
                     echo -e "$STATUS_UNKNOWN ${BOLD}Claude:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET} ${GRAY}- 未找到${RESET}"
                 fi
@@ -644,6 +663,12 @@ show_status() {
                         echo -e "$STATUS_ERROR ${BOLD}Codex:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET} ${GRAY}($time_ago)${RESET}"
                     else
                         echo -e "$STATUS_ERROR ${BOLD}Codex:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET}"
+                    fi
+                elif [[ "$status" == "timeout" ]]; then
+                    if [[ -n "$time_ago" ]]; then
+                        echo -e "$STATUS_TIMEOUT ${BOLD}Codex:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET} ${GRAY}($time_ago)${RESET}"
+                    else
+                        echo -e "$STATUS_TIMEOUT ${BOLD}Codex:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET}"
                     fi
                 else
                     echo -e "$STATUS_UNKNOWN ${BOLD}Codex:${RESET} ${GOLD}$name${RESET} ${GRAY}($channel_id)${RESET} ${GRAY}- 未找到${RESET}"
@@ -866,6 +891,9 @@ for ((i=0; i<config_count; i++)); do
         elif [[ "$status" == "error" ]]; then
             status_icon="$STATUS_ERROR"
             status_color="error"
+        elif [[ "$status" == "timeout" ]]; then
+            status_icon="$STATUS_TIMEOUT"
+            status_color="timeout"
         else
             status_icon="$STATUS_UNKNOWN"
             status_color="unknown"
