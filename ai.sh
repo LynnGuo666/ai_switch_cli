@@ -125,6 +125,27 @@ fetch_health_status() {
     merge_health_data
 }
 
+# 函数：将URL格式化为可点击链接（使用ANSI转义序列）
+format_clickable_url() {
+    local url="$1"
+    if [[ -z "$url" || "$url" == "null" ]]; then
+        echo ""
+        return
+    fi
+    
+    # 使用 OSC 8 转义序列创建可点击链接
+    # 格式: \033]8;;URL\033\\显示文本\033]8;;\033\\
+    # 或者使用 \a (bell) 代替 \033\\: \033]8;;URL\a显示文本\033]8;;\a
+    if [[ -t 1 ]]; then
+        # 在终端中，使用可点击链接格式
+        # 使用 printf 而不是 echo -e，避免转义序列被再次处理
+        printf "\033]8;;%s\033\\%s\033]8;;\033\\" "$url" "$url"
+    else
+        # 非终端环境，直接输出URL
+        echo "$url"
+    fi
+}
+
 # 函数：格式化时间显示为"xx分钟前"（处理UTC时间）
 format_time_ago() {
     local utc_time="$1"
@@ -599,10 +620,12 @@ list_configs() {
         
         if [[ "$ai_type" == "claude" ]]; then
             local url=$(jq -r ".configs[$i].url" "$config_file")
-            echo -e "    ${GRAY}URL:${RESET} $url"
+            local clickable_url=$(format_clickable_url "$url")
+            echo -e "    ${GRAY}URL:${RESET} $clickable_url"
         else
             local base_url=$(jq -r ".configs[$i].base_url" "$config_file")
-            echo -e "    ${GRAY}Base URL:${RESET} $base_url"
+            local clickable_url=$(format_clickable_url "$base_url")
+            echo -e "    ${GRAY}Base URL:${RESET} $clickable_url"
         fi
         echo ""
     done
