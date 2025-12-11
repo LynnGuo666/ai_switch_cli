@@ -1,3 +1,4 @@
 *.json
 .codex/
 codex/
+__pycache__/

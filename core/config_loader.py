@@ -54,13 +54,11 @@ def load_configs(ai_type: str) -> List[Dict[str, Any]]:
 
 
 def list_configs(ai_type: str, configs: List[Dict[str, Any]]) -> List[str]:
-    """返回可展示的配置名称列表。"""
+    """返回可展示的配置名称列表（不显示 channel_id）。"""
     names: List[str] = []
     for idx, cfg in enumerate(configs):
         name = cfg.get("name", "<未命名>")
-        channel_id = cfg.get("channel_id")
-        suffix = f" | channel_id: {channel_id}" if channel_id else ""
-        names.append(f"[{idx}] {name}{suffix}")
+        names.append(f"[{idx}] {name}")
     return names
 
 
