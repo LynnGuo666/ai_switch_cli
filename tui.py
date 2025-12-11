@@ -35,28 +35,64 @@ DEFAULT_HEALTH_URL = os.environ.get("HEALTH_STATUS_URL", "https://check.linux.do
 from core import config_loader, env_service
 
 
-# ----------------- 健康检查拉取 -----------------
-def normalize_health(data: Dict) -> Dict[str, Dict[str, str]]:
-    services: Dict[str, Dict[str, str]] = {}
+# ----------------- 健康检查拉取（按 group 聚合，可有多模型与时间线） -----------------
+def normalize_health(data: Dict) -> Dict[str, List[Dict[str, str]]]:
+    groups: Dict[str, List[Dict[str, str]]] = {}
     if not isinstance(data, dict):
-        return services
+        return groups
+
+    def add_entry(entry: Dict[str, str]) -> None:
+        grp = str(entry.get("group", "") or "")
+        if not grp:
+            grp = "unknown"
+        groups.setdefault(grp, []).append(entry)
+
+    def parse_timeline(item: Dict) -> List[str]:
+        tl = item.get("timeline") or []
+        if not isinstance(tl, list):
+            return []
+        statuses: List[str] = []
+        for t in tl:
+            if isinstance(t, dict):
+                statuses.append(str(t.get("status", "unknown")))
+        return statuses
+
+    # services 结构
     if isinstance(data.get("services"), dict):
-        for cid, val in data["services"].items():
-            if not cid:
+        for _, val in data["services"].items():
+            if not isinstance(val, dict):
                 continue
-            status = str((val or {}).get("status", "unknown"))
-            last = str((val or {}).get("lastCheck", ""))
-            services[cid] = {"status": status, "lastCheck": last}
-    if not services and isinstance(data.get("providers"), list):
+            add_entry(
+                {
+                    "status": str(val.get("status", "unknown")),
+                    "lastCheck": str(val.get("lastCheck", "")),
+                    "model": str(val.get("model", "")),
+                    "name": str(val.get("name", "")),
+                    "group": str(val.get("group", "")),
+                    "latency": str(val.get("latencyMs", "")),
+                    "timeline": parse_timeline(val),
+                }
+            )
+
+    # providers 结构
+    if (not groups) and isinstance(data.get("providers"), list):
         for item in data["providers"]:
-            cid = (item or {}).get("id")
-            if not cid:
+            if not isinstance(item, dict):
                 continue
-            latest = (item or {}).get("latest", {}) or {}
-            status = str(latest.get("status", "unknown"))
-            last = str(latest.get("checkedAt", ""))
-            services[cid] = {"status": status, "lastCheck": last}
-    return services
+            latest = item.get("latest", {}) or {}
+            add_entry(
+                {
+                    "status": str(latest.get("status", "unknown")),
+                    "lastCheck": str(latest.get("checkedAt", "")),
+                    "model": str(item.get("model", "")),
+                    "name": str(item.get("name", "")),
+                    "group": str(item.get("group", "")),
+                    "latency": str(latest.get("latencyMs", "")),
+                    "timeline": parse_timeline(item),
+                }
+            )
+
+    return groups
 
 
 def fetch_health_status(url: str = DEFAULT_HEALTH_URL, timeout: int = 8) -> Tuple[Dict[str, Dict[str, str]], str]:
@@ -130,7 +166,7 @@ class TUI:
         self.selected = 0
         self.scroll_offset = 0
         self.output_lines: List[str] = ["就绪"]
-        self.health_map: Dict[str, Dict[str, str]] = {}
+        self.health_map: Dict[str, List[Dict[str, str]]] = {}
         self._init_colors()
         self.load_configs()
 
@@ -158,7 +194,7 @@ class TUI:
         elif not self.health_map:
             self.output_lines.append("[Warning] 渠道状态获取为空（已忽略）")
         else:
-            self.output_lines.append(f"[Info] 已获取渠道状态: {len(self.health_map)} 条")
+            self.output_lines.append(f"[Info] 已获取渠道状态: {len(self.health_map)} 组")
 
     # 数据与过滤 ----------------------------------------------------------
     def load_configs(self) -> None:
@@ -231,7 +267,7 @@ class TUI:
         if cfg:
             cfg_map = config_loader.CONFIG_MAP[self.ai_type]
             token_key, url_key = cfg_map["json_token"], cfg_map["json_url"]
-            status_line, _ = self.get_status_detail(self.filtered_idx[min(self.selected, len(self.filtered_idx) - 1)] if self.filtered_idx else None)
+            status_line, status_color, timeline = self.get_status_detail(self.filtered_idx[min(self.selected, len(self.filtered_idx) - 1)] if self.filtered_idx else None)
             details = [
                 f"名称: {cfg.get('name','')}",
                 f"URL/Base: {cfg.get(url_key,'')}",
@@ -243,7 +279,14 @@ class TUI:
             for line in details:
                 if detail_y >= max_y - 4:
                     break
-                self.stdscr.addnstr(detail_y, list_w, line, list_w - 2)
+                attr = curses.color_pair(status_color) if line.startswith("状态:") else curses.color_pair(1)
+                self.stdscr.addnstr(detail_y, list_w, line, list_w - 2, attr)
+                detail_y += 1
+
+            # 历史条
+            if timeline and detail_y < max_y - 3:
+                self.stdscr.addnstr(detail_y, list_w, "历史: ", list_w - 2, curses.A_BOLD)
+                self._draw_history(detail_y, list_w + 4, list_w - 6, timeline)
                 detail_y += 1
         else:
             self.stdscr.addnstr(2, list_w, "未选择配置", list_w - 2)
@@ -275,39 +318,75 @@ class TUI:
         status = (status or "unknown").lower()
         if status == "ok":
             return "O", 5
+        if status == "operational":
+            return "O", 5
         if status == "error":
             return "X", 6
         if status == "timeout":
             return "!", 7
+        if status == "degraded":
+            return "~", 7
         return "?", 8
 
-    def get_status_for(self, real_idx: int) -> Tuple[str, int]:
-        """用于列表显示的状态文字和颜色。"""
-        if real_idx is None or real_idx >= len(self.configs):
+    def _group_entries(self, cfg: Dict) -> List[Dict[str, str]]:
+        group = str(cfg.get("group", "") or "")
+        if not group:
+            return []
+        return self.health_map.get(group, [])
+
+    def _choose_status(self, entries: List[Dict[str, str]]) -> Tuple[str, int]:
+        if not entries:
             return "[?]", 8
-        cfg = self.configs[real_idx]
-        channel_id = str(cfg.get("channel_id", "") or "")
-        if not channel_id:
-            return "[?]", 8
-        info = self.health_map.get(channel_id, {})
-        icon, color = self._status_icon(info.get("status"))
+        severity_order = ["error", "timeout", "failed", "degraded", "operational", "ok", "unknown"]
+        best = "unknown"
+        for e in entries:
+            st = str(e.get("status", "unknown")).lower()
+            if severity_order.index(st) < severity_order.index(best):
+                best = st
+        icon, color = self._status_icon(best)
         return f"[{icon}]", color
 
-    def get_status_detail(self, real_idx: int | None) -> Tuple[str, int]:
-        """用于详情显示，附带 lastCheck。"""
+    def get_status_for(self, real_idx: int) -> Tuple[str, int]:
+        """用于列表显示的状态文字和颜色（按 group 聚合）。"""
         if real_idx is None or real_idx >= len(self.configs):
-            return "unknown", 8
+            return "[?]", 8
         cfg = self.configs[real_idx]
-        channel_id = str(cfg.get("channel_id", "") or "")
-        if not channel_id:
-            return "unknown (无 channel_id)", 8
-        info = self.health_map.get(channel_id, {})
-        status = info.get("status", "unknown")
-        last = info.get("lastCheck", "")
-        icon, color = self._status_icon(status)
-        if last:
-            return f"{icon} {status} | last: {last}", color
-        return f"{icon} {status}", color
+        entries = self._group_entries(cfg)
+        return self._choose_status(entries)
+
+    def get_status_detail(self, real_idx: int | None) -> Tuple[str, int, List[str]]:
+        """用于详情显示，列出该 group 下的所有模型状态，并返回时间线。"""
+        if real_idx is None or real_idx >= len(self.configs):
+            return "unknown", 8, []
+        cfg = self.configs[real_idx]
+        entries = self._group_entries(cfg)
+        if not entries:
+            return "unknown (无匹配 group)", 8, []
+        status_texts = []
+        timeline: List[str] = []
+        for e in entries:
+            icon, _color = self._status_icon(e.get("status"))
+            tl = e.get("timeline") or []
+            if tl and not timeline:
+                timeline = tl  # 取该组第一条的时间线
+            status_texts.append(
+                f"{icon} {e.get('status','unknown')} {e.get('model','') or e.get('name','') or ''} @{e.get('lastCheck','')}"
+            )
+        best_icon, color = self._choose_status(entries)
+        return "; ".join(status_texts) or f"{best_icon} unknown", color, timeline
+
+    def _draw_history(self, y: int, x: int, width: int, timeline: List[str]) -> None:
+        if width <= 0:
+            return
+        # 取最新的若干条（右侧显示），最多 20
+        tail = timeline[-20:]
+        start_x = x
+        for st in tail:
+            _icon, color = self._status_icon(st)
+            self.stdscr.addnstr(y, start_x, "|", 1, curses.color_pair(color))
+            start_x += 1
+            if start_x - x >= width:
+                break
 
     def current_cfg(self) -> Dict | None:
         if not self.filtered_idx:
