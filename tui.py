@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Dict, List, Tuple
 from urllib.request import Request, build_opener, ProxyHandler, HTTPSHandler
 import ssl
@@ -130,9 +131,9 @@ def fetch_health_status(url: str = DEFAULT_HEALTH_URL, timeout: int = 8) -> Tupl
             handlers.append(HTTPSHandler(context=ctx))
         return build_opener(*handlers)
 
-    def _do_fetch(ctx: ssl.SSLContext | None) -> Tuple[Dict[str, Dict[str, str]], str]:
+    def _do_fetch(ctx: ssl.SSLContext | None, use_proxy: bool = True) -> Tuple[Dict[str, Dict[str, str]], str]:
         try:
-            opener = _build_opener(ctx)
+            opener = _build_opener(ctx) if use_proxy else _build_opener(ctx if ctx else None)
             with opener.open(req, timeout=timeout) as resp:
                 raw = resp.read()
             data = json.loads(raw.decode("utf-8"))
@@ -141,19 +142,45 @@ def fetch_health_status(url: str = DEFAULT_HEALTH_URL, timeout: int = 8) -> Tupl
             return {}, str(exc)
 
     # 先正常验证
-    data, err = _do_fetch(None)
+    data, err = _do_fetch(None, use_proxy=True)
     if data or not err:
         return data, err
 
     # 证书校验失败时自动降级为不校验证书
     if "CERTIFICATE_VERIFY_FAILED" in err:
         insecure_ctx = ssl._create_unverified_context()
-        data2, err2 = _do_fetch(insecure_ctx)
+        data2, err2 = _do_fetch(insecure_ctx, use_proxy=True)
         if data2 or not err2:
             return data2, ""
-        return data2, err2
+        # 继续尝试在不使用代理的情况下拉取
+        data3, err3 = _do_fetch(insecure_ctx, use_proxy=False)
+        if data3 or not err3:
+            return data3, ""
+        return data3, err3
 
-    return data, err
+    # 其他错误，尝试不走代理再试一次
+    data_np, err_np = _do_fetch(None, use_proxy=False)
+    if data_np or not err_np:
+        return data_np, ""
+
+    return data, err_np or err
+
+    def _fmt_ago(self, ts: str) -> str:
+        if not ts:
+            return ""
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            diff = (now - dt).total_seconds()
+            if diff < 60:
+                return f"{int(diff)}s前"
+            if diff < 3600:
+                return f"{int(diff/60)}m前"
+            if diff < 86400:
+                return f"{int(diff/3600)}h前"
+            return f"{int(diff/86400)}d前"
+        except Exception:
+            return ts
 
 
 class TUI:
@@ -216,7 +243,7 @@ class TUI:
         names = config_loader.list_configs(self.ai_type, self.configs)
         for i, display in enumerate(names):
             cfg = self.configs[i]
-            text_blob = f"{cfg.get('name','')} {cfg.get('channel_id','')}".lower()
+            text_blob = f"{cfg.get('name','')} {cfg.get('group','')}".lower()
             if key and key not in text_blob:
                 continue
             self.filtered_idx.append(i)
@@ -267,12 +294,12 @@ class TUI:
         if cfg:
             cfg_map = config_loader.CONFIG_MAP[self.ai_type]
             token_key, url_key = cfg_map["json_token"], cfg_map["json_url"]
-            status_line, status_color, timeline = self.get_status_detail(self.filtered_idx[min(self.selected, len(self.filtered_idx) - 1)] if self.filtered_idx else None)
+            status_lines, status_color, timeline = self.get_status_detail(self.filtered_idx[min(self.selected, len(self.filtered_idx) - 1)] if self.filtered_idx else None)
             details = [
                 f"名称: {cfg.get('name','')}",
                 f"URL/Base: {cfg.get(url_key,'')}",
-                f"Channel ID: {cfg.get('channel_id','') or ''}",
-                f"状态: {status_line}",
+                f"分组: {cfg.get('group','') or '未配置'}",
+                "状态:",
                 "----------------------------------------",
                 "快捷键: e 导出临时, w 写入 shell, r 刷新, x/X 清空",
             ]
@@ -281,6 +308,12 @@ class TUI:
                     break
                 attr = curses.color_pair(status_color) if line.startswith("状态:") else curses.color_pair(1)
                 self.stdscr.addnstr(detail_y, list_w, line, list_w - 2, attr)
+                detail_y += 1
+
+            for s_line in status_lines:
+                if detail_y >= max_y - 4:
+                    break
+                self.stdscr.addnstr(detail_y, list_w, f"  {s_line}", list_w - 2, curses.color_pair(status_color))
                 detail_y += 1
 
             # 历史条
@@ -354,26 +387,28 @@ class TUI:
         entries = self._group_entries(cfg)
         return self._choose_status(entries)
 
-    def get_status_detail(self, real_idx: int | None) -> Tuple[str, int, List[str]]:
+    def get_status_detail(self, real_idx: int | None) -> Tuple[List[str], int, List[str]]:
         """用于详情显示，列出该 group 下的所有模型状态，并返回时间线。"""
         if real_idx is None or real_idx >= len(self.configs):
-            return "unknown", 8, []
+            return ["unknown"], 8, []
         cfg = self.configs[real_idx]
         entries = self._group_entries(cfg)
         if not entries:
-            return "unknown (无匹配 group)", 8, []
-        status_texts = []
+            return ["unknown (无匹配 group)"], 8, []
+        lines: List[str] = []
         timeline: List[str] = []
         for e in entries:
             icon, _color = self._status_icon(e.get("status"))
             tl = e.get("timeline") or []
             if tl and not timeline:
                 timeline = tl  # 取该组第一条的时间线
-            status_texts.append(
-                f"{icon} {e.get('status','unknown')} {e.get('model','') or e.get('name','') or ''} @{e.get('lastCheck','')}"
-            )
-        best_icon, color = self._choose_status(entries)
-        return "; ".join(status_texts) or f"{best_icon} unknown", color, timeline
+            ago = self._fmt_ago(e.get("lastCheck", ""))
+            line = f"{icon} {e.get('model','') or e.get('name','') or ''} {e.get('status','unknown')}"
+            if ago:
+                line += f" ({ago})"
+            lines.append(line.strip())
+        _best_icon, color = self._choose_status(entries)
+        return lines, color, timeline
 
     def _draw_history(self, y: int, x: int, width: int, timeline: List[str]) -> None:
         if width <= 0:

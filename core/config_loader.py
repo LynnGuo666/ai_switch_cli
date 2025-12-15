@@ -58,7 +58,9 @@ def list_configs(ai_type: str, configs: List[Dict[str, Any]]) -> List[str]:
     names: List[str] = []
     for idx, cfg in enumerate(configs):
         name = cfg.get("name", "<未命名>")
-        names.append(f"[{idx}] {name}")
+        group = cfg.get("group", "")
+        suffix = f"  ({group})" if group else ""
+        names.append(f"[{idx}] {name}{suffix}")
     return names
 
 
