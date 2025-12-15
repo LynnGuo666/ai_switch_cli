@@ -69,3 +69,10 @@ def remove_permanent(keys: List[str]) -> Path:
     filtered = [ln for ln in lines if should_keep(ln)]
     shell_cfg.write_text("\n".join(filtered) + ("\n" if filtered else ""), encoding="utf-8")
     return shell_cfg
+
+
+
+
+
+
+

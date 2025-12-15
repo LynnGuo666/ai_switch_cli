@@ -86,3 +86,10 @@ def pick_config(
         options = ", ".join(f"[{i}] {c.get('name')}" for i, c in matches)
         raise ConfigLoadError(f"找到多条匹配，请用索引指定: {options}")
     return matches[0]
+
+
+
+
+
+
+
