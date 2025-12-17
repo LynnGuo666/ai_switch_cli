@@ -94,7 +94,7 @@ def save_settings(settings: Dict) -> None:
 
 
 # ----------------- 健康检查拉取 -----------------
-def normalize_health(data: Dict) -> Dict[str, List[Dict]]:
+def normalize_health(data: Dict, ai_type: str = "claude") -> Dict[str, List[Dict]]:
     """解析健康检查 API 返回数据。
 
     返回结构:
@@ -103,7 +103,7 @@ def normalize_health(data: Dict) -> Dict[str, List[Dict]]:
             {
                 "name": "CC 专用-2api",
                 "model": "Claude Code专用-2api",
-                "status": "timeout",
+                "status": "slow",
                 "latency": "4654",
                 "uptime": "97.50",
                 "lastCheck": "2025-12-17T15:00:00",
@@ -134,10 +134,31 @@ def normalize_health(data: Dict) -> Dict[str, List[Dict]]:
 
     def status_code_to_str(code) -> str:
         """将数字状态码转换为字符串状态"""
-        code_map = {1: "ok", 2: "timeout", 3: "error"}
+        code_map = {1: "ok", 2: "slow", 3: "error"}
         if isinstance(code, int):
             return code_map.get(code, "unknown")
         return str(code) if code else "unknown"
+
+    def is_matching_channel(svc: Dict) -> bool:
+        """判断渠道是否匹配当前 ai_type，优先使用 model_type_label"""
+        model_type = str(svc.get("model_type_label") or svc.get("model_type_code") or "").lower()
+
+        # 优先使用 model_type_label 精确匹配
+        if model_type:
+            if ai_type == "claude":
+                return model_type == "claude_code"
+            else:  # codex
+                return model_type == "codex"
+
+        # 回退到关键词匹配（兼容旧数据）
+        model_name = str(svc.get("model_name") or "").lower()
+        channel_name = str(svc.get("channel_name") or "").lower()
+        text = f"{model_name} {channel_name}"
+
+        if ai_type == "claude":
+            return any(kw in text for kw in ["claude", "cc专用", "cc ", "sonnet", "opus", "haiku"])
+        else:  # codex
+            return any(kw in text for kw in ["codex", "gpt", "openai"])
 
     def timestamp_to_iso(ts) -> str:
         """将毫秒时间戳转换为 ISO 格式（API 返回北京时间）"""
@@ -152,8 +173,8 @@ def normalize_health(data: Dict) -> Dict[str, List[Dict]]:
             pass
         return str(ts)
 
-    def parse_nodes(svc: Dict) -> List[Dict]:
-        """解析 timeline 中的所有节点数据"""
+    def parse_nodes_with_services(svc: Dict, service_name: str) -> List[Dict]:
+        """解析 timeline 中的所有节点数据，返回节点列表，每个节点包含该 service 的检测数据"""
         nodes_data: Dict[int, Dict] = {}  # node_id -> node_data
         tl = svc.get("timeline") or []
         if not isinstance(tl, list):
@@ -172,65 +193,126 @@ def normalize_health(data: Dict) -> Dict[str, List[Dict]]:
 
                 if node_id not in nodes_data:
                     nodes_data[node_id] = {
-                        "name": node_info.get("node_name_zh") or node_info.get("node_name_en", ""),
-                        "availability": 0.0,
-                        "latency_avg": 0.0,
-                        "results": [],
-                        "count_total": 0,
-                        "count_success": 0,
+                        "node_id": node_id,
+                        "node_name": node_info.get("node_name_zh") or node_info.get("node_name_en", ""),
+                        "services": [],  # 该节点检测的 service 列表
                     }
 
-                # 累加数据
+                # 累加数据到临时变量
                 nd = nodes_data[node_id]
-                nd["results"].extend(node_info.get("results") or [])
-                nd["count_total"] += node_info.get("count_total", 0)
-                nd["count_success"] += node_info.get("count_success", 0)
-                # 取最新的延迟
-                if node_info.get("latency_avg"):
-                    nd["latency_avg"] = node_info.get("latency_avg", 0)
+                if "temp_results" not in nd:
+                    nd["temp_results"] = []
+                    nd["temp_count_total"] = 0
+                    nd["temp_count_success"] = 0
+                    nd["temp_latency_avg"] = 0
 
-        # 计算可用率
+                nd["temp_results"].extend(node_info.get("results") or [])
+                nd["temp_count_total"] += node_info.get("count_total", 0)
+                nd["temp_count_success"] += node_info.get("count_success", 0)
+                if node_info.get("latency_avg"):
+                    nd["temp_latency_avg"] = node_info.get("latency_avg", 0)
+
+        # 计算可用率并构建 service 数据
         result = []
         for node_id, nd in sorted(nodes_data.items()):
-            if nd["count_total"] > 0:
-                nd["availability"] = nd["count_success"] / nd["count_total"]
-            nd["results"] = nd["results"][-50:]  # 只保留最近50个
-            result.append(nd)
+            avail = 0.0
+            if nd.get("temp_count_total", 0) > 0:
+                avail = nd["temp_count_success"] / nd["temp_count_total"]
+
+            # 构建该节点的 service 检测结果
+            results = nd.get("temp_results", [])[-50:]
+            # 计算最近状态
+            recent_status = "unknown"
+            if results:
+                last = results[-1]
+                recent_status = {1: "ok", 2: "slow", 3: "error"}.get(last, "unknown")
+
+            service_entry = {
+                "name": service_name,
+                "status": recent_status,
+                "availability": avail,
+                "latency_avg": nd.get("temp_latency_avg", 0),
+                "results": results,
+            }
+
+            result.append({
+                "node_id": node_id,
+                "node_name": nd["node_name"],
+                "service": service_entry,
+            })
 
         return result
 
     def parse_timeline_simple(svc: Dict) -> List[str]:
         """解析 timeline 为简单状态列表（用于历史条显示）"""
-        nodes = parse_nodes(svc)
-        if not nodes:
+        tl = svc.get("timeline") or []
+        if not isinstance(tl, list) or not tl:
             return []
-        # 取第一个节点的 results
-        results = nodes[0].get("results", [])
-        return [status_code_to_str(r) for r in results[-50:]]
+        # 取第一个 block 的第一个节点的 results
+        first_block = tl[0] if tl else {}
+        nodes = first_block.get("nodes") or {}
+        for node_key, node_info in nodes.items():
+            if isinstance(node_info, dict):
+                results = node_info.get("results") or []
+                return [status_code_to_str(r) for r in results[-50:]]
+        return []
+
+    # 按节点聚合所有 service 的检测数据
+    # nodes_aggregated: {node_id: {"node_name": str, "services": [...]}}
+    nodes_aggregated: Dict[int, Dict] = {}
 
     # api-db.lib00.com 格式 (services 是 list)
     if isinstance(data.get("services"), list):
         for svc in data["services"]:
             if not isinstance(svc, dict):
                 continue
+            # 过滤不匹配的渠道
+            if not is_matching_channel(svc):
+                continue
+
             current = svc.get("current_status") or {}
             status_code = current.get("status", 0)
+            service_name = str(svc.get("channel_name") or svc.get("model_name", ""))
+
+            # 解析该 service 在各节点的检测数据
+            node_entries = parse_nodes_with_services(svc, service_name)
+            for ne in node_entries:
+                node_id = ne["node_id"]
+                if node_id not in nodes_aggregated:
+                    nodes_aggregated[node_id] = {
+                        "node_name": ne["node_name"],
+                        "services": [],
+                    }
+                nodes_aggregated[node_id]["services"].append(ne["service"])
+
             add_entry({
                 "status": status_code_to_str(status_code),
-                "lastCheck": timestamp_to_iso(generated_at),  # 使用 generated_at 作为检查时间
+                "lastCheck": timestamp_to_iso(generated_at),
                 "model": str(svc.get("model_name", "")),
-                "name": str(svc.get("channel_name") or svc.get("model_name", "")),
+                "name": service_name,
                 "group": str(svc.get("provider_name") or svc.get("provider_code", "")),
                 "latency": str(current.get("latency_ms", "")),
                 "uptime": str(current.get("uptime_percent", "")),
-                "nodes": parse_nodes(svc),
+                "nodes_by_service": [],  # 旧字段保留兼容
                 "timeline": parse_timeline_simple(svc),
             })
+
+    # 将聚合的节点数据添加到返回结果
+    # 存储在特殊 key "__nodes__" 中
+    if nodes_aggregated:
+        nodes_list = []
+        for node_id, nd in sorted(nodes_aggregated.items()):
+            nodes_list.append({
+                "node_id": node_id,
+                "node_name": nd["node_name"],
+                "services": nd["services"],
+            })
+        groups["__nodes__"] = nodes_list
 
     return groups
 
 
-def fetch_health_status(url: str, timeout: int = 15) -> Tuple[Dict[str, List[Dict[str, str]]], str]:
+def fetch_health_status(url: str, ai_type: str = "claude", timeout: int = 15) -> Tuple[Dict[str, List[Dict[str, str]]], str]:
     """获取渠道状态，返回 (map, error_msg)。优先使用 cloudscraper，回退到 requests。"""
     # 代理设置
     def get_proxy():
@@ -252,7 +334,7 @@ def fetch_health_status(url: str, timeout: int = 15) -> Tuple[Dict[str, List[Dic
         resp = scraper.get(url, timeout=timeout)
         if resp.status_code == 200:
             data = resp.json()
-            return normalize_health(data), ""
+            return normalize_health(data, ai_type), ""
     except ImportError:
         pass
     except Exception:
@@ -265,7 +347,7 @@ def fetch_health_status(url: str, timeout: int = 15) -> Tuple[Dict[str, List[Dic
                            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"})
         if resp.status_code == 200:
             data = resp.json()
-            return normalize_health(data), ""
+            return normalize_health(data, ai_type), ""
         return {}, f"HTTP {resp.status_code} (可能被 CF 盾拦截)"
     except ImportError:
         return {}, "请安装 requests 或 cloudscraper"
@@ -389,8 +471,9 @@ class TUI:
         self.health_error = ""
         self._msg("[状态] 正在获取...")
 
+        ai_type = self.ai_type  # 捕获当前 ai_type
         def _fetch():
-            health, err = fetch_health_status(url)
+            health, err = fetch_health_status(url, ai_type)
             self.health_map = health
             self.health_loading = False
             if err:
@@ -437,12 +520,12 @@ class TUI:
     def _status_icon(self, status: str) -> Tuple[str, int]:
         status = (status or "unknown").lower()
         if status in ("ok", "operational"):
-            return "●", 5
-        if status == "error":
-            return "●", 6
-        if status in ("timeout", "degraded"):
-            return "●", 7
-        return "○", 1
+            return "●", 5   # 绿色
+        if status == "slow":
+            return "●", 4   # 黄色 (作为橙色替代)
+        if status in ("error", "timeout", "failed"):
+            return "●", 6   # 红色
+        return "○", 1       # 白色/未知
 
     def _group_entries(self, cfg: Dict) -> List[Dict[str, str]]:
         group = str(cfg.get("group", "") or "")
@@ -451,7 +534,7 @@ class TUI:
     def _choose_status(self, entries: List[Dict[str, str]]) -> Tuple[str, int]:
         if not entries:
             return "○", 1
-        severity = {"error": 0, "timeout": 1, "failed": 1, "degraded": 2, "ok": 3, "operational": 3, "unknown": 4}
+        severity = {"error": 0, "failed": 0, "slow": 1, "degraded": 2, "ok": 3, "operational": 3, "unknown": 4}
         best_st = "unknown"
         best_score = 99
         for e in entries:
@@ -512,13 +595,13 @@ class TUI:
         for i, cfg in enumerate(self.configs):
             if str(cfg.get(token_key, "") or "") == token_env and str(cfg.get(url_key, "") or "") == url_env:
                 return cfg.get("name", "已匹配"), i
-        # 自定义配置：显示 URL
+        # 自定义配置：显示 URL 和 Key
         if url_env:
-            # 提取域名部分
             import re
             match = re.search(r'https?://([^/]+)', url_env)
             domain = match.group(1) if match else url_env[:20]
-            return f"自定义({domain})", None
+            key_short = self._mask_key(token_env) if token_env else "无Key"
+            return f"自定义({domain}) {key_short}", None
         short = f"{token_env[:8]}..." if len(token_env) > 8 else token_env or "?"
         return f"自定义({short})", None
 
@@ -635,7 +718,7 @@ class TUI:
 
                 # 状态详情
                 real_idx = self.filtered_idx[min(self.selected, len(self.filtered_idx) - 1)]
-                status_lines, status_color, timeline, nodes = self.get_status_detail(real_idx)
+                status_lines, status_color, timeline, _ = self.get_status_detail(real_idx)
                 status_label = "状态:" + status_suffix
                 self.stdscr.addnstr(detail_y, detail_x, status_label, detail_w, curses.A_UNDERLINE)
                 detail_y += 1
@@ -645,49 +728,64 @@ class TUI:
                     self.stdscr.addnstr(detail_y, detail_x, f"  {sl_text[:detail_w-2]}", detail_w, curses.color_pair(sl_color))
                     detail_y += 1
 
-                # 检测节点
-                if nodes and detail_y < max_y - 5:
+                # 检测节点（按节点分组，每个节点下显示 services）
+                nodes_data = self.health_map.get("__nodes__", [])
+                if nodes_data and detail_y < max_y - 5:
                     detail_y += 1
                     self.stdscr.addnstr(detail_y, detail_x, "检测节点:", detail_w, curses.A_UNDERLINE)
                     detail_y += 1
-                    for nd in nodes[:4]:
+                    for nd in nodes_data:
                         if detail_y >= max_y - 4:
                             break
-                        node_name = nd.get("name", "")[:12]
-                        avail = nd.get("availability", 0)
-                        avail_pct = f"{avail*100:.1f}%"
+                        node_name = nd.get("node_name", "")[:14]
+                        services = nd.get("services", [])
+                        # 计算节点整体可用率
+                        total_avail = sum(s.get("availability", 0) for s in services)
+                        avg_avail = total_avail / len(services) if services else 0
                         # 节点状态图标
-                        if avail >= 0.95:
+                        if avg_avail >= 0.95:
                             node_icon, node_color = "●", 5  # 绿色
-                        elif avail >= 0.8:
-                            node_icon, node_color = "●", 7  # 紫色
+                        elif avg_avail >= 0.8:
+                            node_icon, node_color = "●", 4  # 黄色
                         else:
                             node_icon, node_color = "●", 6  # 红色
-                        # 历史条
-                        results = nd.get("results", [])[-15:]
-                        history_bar = ""
-                        for r in results:
-                            if r == 1:
-                                history_bar += "│"
-                            elif r == 2:
-                                history_bar += "┃"
-                            else:
-                                history_bar += "█"
-                        node_line = f"  {node_icon} {node_name:<12} {avail_pct:>6}"
-                        self.stdscr.addnstr(detail_y, detail_x, node_line, len(node_line), curses.color_pair(node_color))
-                        # 绘制历史条（带颜色）
-                        bar_x = detail_x + len(node_line) + 1
-                        for i, r in enumerate(results):
-                            if bar_x + i >= detail_x + detail_w - 1:
-                                break
-                            if r == 1:
-                                bar_char, bar_color = "│", 5
-                            elif r == 2:
-                                bar_char, bar_color = "│", 7
-                            else:
-                                bar_char, bar_color = "│", 6
-                            self.stdscr.addnstr(detail_y, bar_x + i, bar_char, 1, curses.color_pair(bar_color))
+                        # 绘制节点行
+                        node_line = f"{node_icon} {node_name}"
+                        self.stdscr.addnstr(detail_y, detail_x, node_line, detail_w, curses.color_pair(node_color) | curses.A_BOLD)
                         detail_y += 1
+                        # 绘制该节点下的 services
+                        for svc in services[:6]:  # 每个节点最多显示6个 service
+                            if detail_y >= max_y - 4:
+                                break
+                            svc_name = svc.get("name", "")
+                            svc_status = svc.get("status", "unknown")
+                            svc_avail = svc.get("availability", 0)
+                            svc_icon, svc_color = self._status_icon(svc_status)
+                            results = svc.get("results", [])[-10:]
+                            avail_str = f"{svc_avail*100:.1f}%"
+
+                            # 分段绘制：图标+名称 | 百分比 | 历史条
+                            # 图标和名称
+                            name_max = 18
+                            svc_name_trunc = svc_name[:name_max]
+                            self.stdscr.addnstr(detail_y, detail_x, f"  {svc_icon} ", 4, curses.color_pair(svc_color))
+                            self.stdscr.addnstr(detail_y, detail_x + 4, svc_name_trunc, name_max, curses.color_pair(svc_color))
+                            # 百分比（固定位置）
+                            pct_x = detail_x + 4 + name_max + 1
+                            self.stdscr.addnstr(detail_y, pct_x, avail_str, 6, curses.color_pair(svc_color))
+                            # 历史条（固定位置）
+                            bar_x = pct_x + 7
+                            for i, r in enumerate(results):
+                                if bar_x + i >= detail_x + detail_w - 1:
+                                    break
+                                if r == 1:
+                                    bar_char, bar_color = "│", 5
+                                elif r == 2:
+                                    bar_char, bar_color = "│", 4
+                                else:
+                                    bar_char, bar_color = "│", 6
+                                self.stdscr.addnstr(detail_y, bar_x + i, bar_char, 1, curses.color_pair(bar_color))
+                            detail_y += 1
 
                 # 历史条（整体）
                 if timeline and detail_y < max_y - 4:

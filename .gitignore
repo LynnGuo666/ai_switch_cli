@@ -2,3 +2,4 @@
 .codex/
 codex/
 __pycache__/
+build/
