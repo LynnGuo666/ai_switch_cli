@@ -29,10 +29,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# 默认状态站 URL
-DEFAULT_HEALTH_URL = "https://check.linux.do/api/v1/status"
-SETTINGS_FILE = Path(__file__).resolve().parent / ".tui_settings.json"
-ENV_FILE = Path(__file__).resolve().parent / ".env"
+# 默认状态站 URL (api-db.lib00.com 格式)
+DEFAULT_HEALTH_URL = "https://api-api-db.lib00.com/v1/monitor/data?range=24h"
+
+# PyInstaller 打包后 __file__ 指向临时解压目录，需要用 sys.executable 获取真实路径
+if getattr(sys, 'frozen', False):
+    # PyInstaller 打包后的可执行文件
+    _BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    # 普通 Python 运行
+    _BASE_DIR = Path(__file__).resolve().parent
+
+SETTINGS_FILE = _BASE_DIR / ".tui_settings.json"
+ENV_FILE = _BASE_DIR / ".env"
 
 
 def load_dotenv():
@@ -85,56 +94,137 @@ def save_settings(settings: Dict) -> None:
 
 
 # ----------------- 健康检查拉取 -----------------
-def normalize_health(data: Dict) -> Dict[str, List[Dict[str, str]]]:
-    groups: Dict[str, List[Dict[str, str]]] = {}
+def normalize_health(data: Dict) -> Dict[str, List[Dict]]:
+    """解析健康检查 API 返回数据。
+
+    返回结构:
+    {
+        "DuckCoding": [
+            {
+                "name": "CC 专用-2api",
+                "model": "Claude Code专用-2api",
+                "status": "timeout",
+                "latency": "4654",
+                "uptime": "97.50",
+                "lastCheck": "2025-12-17T15:00:00",
+                "nodes": [
+                    {"name": "duckcoding自测", "availability": 0.968, "latency_avg": 5936.48, "results": [1,1,1,...]},
+                    ...
+                ]
+            }
+        ]
+    }
+    """
+    groups: Dict[str, List[Dict]] = {}
     if not isinstance(data, dict):
         return groups
 
-    def add_entry(entry: Dict[str, str]) -> None:
+    # 检查是否是 api-db.lib00.com 格式 (包含 data 包装)
+    if data.get("code") == 200 and isinstance(data.get("data"), dict):
+        data = data["data"]
+
+    # 获取数据生成时间（上次检查时间）
+    generated_at = data.get("generated_at")
+
+    def add_entry(entry: Dict) -> None:
         grp = str(entry.get("group", "") or "")
         if not grp:
             grp = "unknown"
         groups.setdefault(grp, []).append(entry)
 
-    def parse_timeline(item: Dict) -> List[str]:
-        tl = item.get("timeline") or []
+    def status_code_to_str(code) -> str:
+        """将数字状态码转换为字符串状态"""
+        code_map = {1: "ok", 2: "timeout", 3: "error"}
+        if isinstance(code, int):
+            return code_map.get(code, "unknown")
+        return str(code) if code else "unknown"
+
+    def timestamp_to_iso(ts) -> str:
+        """将毫秒时间戳转换为 ISO 格式（API 返回北京时间）"""
+        if not ts:
+            return ""
+        try:
+            if isinstance(ts, (int, float)):
+                # API 返回的是北京时间的时间戳，直接用本地时间解析
+                dt = datetime.fromtimestamp(ts / 1000)
+                return dt.isoformat()
+        except Exception:
+            pass
+        return str(ts)
+
+    def parse_nodes(svc: Dict) -> List[Dict]:
+        """解析 timeline 中的所有节点数据"""
+        nodes_data: Dict[int, Dict] = {}  # node_id -> node_data
+        tl = svc.get("timeline") or []
         if not isinstance(tl, list):
             return []
-        statuses: List[str] = []
-        for t in tl:
-            if isinstance(t, dict):
-                statuses.append(str(t.get("status", "unknown")))
-        return statuses
 
-    # services 结构
-    if isinstance(data.get("services"), dict):
-        for _, val in data["services"].items():
-            if not isinstance(val, dict):
+        for block in tl:
+            if not isinstance(block, dict):
                 continue
-            add_entry({
-                "status": str(val.get("status", "unknown")),
-                "lastCheck": str(val.get("lastCheck", "")),
-                "model": str(val.get("model", "")),
-                "name": str(val.get("name", "")),
-                "group": str(val.get("group", "")),
-                "latency": str(val.get("latencyMs", "")),
-                "timeline": parse_timeline(val),
-            })
+            nodes = block.get("nodes") or {}
+            for node_key, node_info in nodes.items():
+                if not isinstance(node_info, dict):
+                    continue
+                node_id = node_info.get("node_id")
+                if node_id is None:
+                    continue
 
-    # providers 结构
-    if (not groups) and isinstance(data.get("providers"), list):
-        for item in data["providers"]:
-            if not isinstance(item, dict):
+                if node_id not in nodes_data:
+                    nodes_data[node_id] = {
+                        "name": node_info.get("node_name_zh") or node_info.get("node_name_en", ""),
+                        "availability": 0.0,
+                        "latency_avg": 0.0,
+                        "results": [],
+                        "count_total": 0,
+                        "count_success": 0,
+                    }
+
+                # 累加数据
+                nd = nodes_data[node_id]
+                nd["results"].extend(node_info.get("results") or [])
+                nd["count_total"] += node_info.get("count_total", 0)
+                nd["count_success"] += node_info.get("count_success", 0)
+                # 取最新的延迟
+                if node_info.get("latency_avg"):
+                    nd["latency_avg"] = node_info.get("latency_avg", 0)
+
+        # 计算可用率
+        result = []
+        for node_id, nd in sorted(nodes_data.items()):
+            if nd["count_total"] > 0:
+                nd["availability"] = nd["count_success"] / nd["count_total"]
+            nd["results"] = nd["results"][-50:]  # 只保留最近50个
+            result.append(nd)
+
+        return result
+
+    def parse_timeline_simple(svc: Dict) -> List[str]:
+        """解析 timeline 为简单状态列表（用于历史条显示）"""
+        nodes = parse_nodes(svc)
+        if not nodes:
+            return []
+        # 取第一个节点的 results
+        results = nodes[0].get("results", [])
+        return [status_code_to_str(r) for r in results[-50:]]
+
+    # api-db.lib00.com 格式 (services 是 list)
+    if isinstance(data.get("services"), list):
+        for svc in data["services"]:
+            if not isinstance(svc, dict):
                 continue
-            latest = item.get("latest", {}) or {}
+            current = svc.get("current_status") or {}
+            status_code = current.get("status", 0)
             add_entry({
-                "status": str(latest.get("status", "unknown")),
-                "lastCheck": str(latest.get("checkedAt", "")),
-                "model": str(item.get("model", "")),
-                "name": str(item.get("name", "")),
-                "group": str(item.get("group", "")),
-                "latency": str(latest.get("latencyMs", "")),
-                "timeline": parse_timeline(item),
+                "status": status_code_to_str(status_code),
+                "lastCheck": timestamp_to_iso(generated_at),  # 使用 generated_at 作为检查时间
+                "model": str(svc.get("model_name", "")),
+                "name": str(svc.get("channel_name") or svc.get("model_name", "")),
+                "group": str(svc.get("provider_name") or svc.get("provider_code", "")),
+                "latency": str(current.get("latency_ms", "")),
+                "uptime": str(current.get("uptime_percent", "")),
+                "nodes": parse_nodes(svc),
+                "timeline": parse_timeline_simple(svc),
             })
 
     return groups
@@ -189,6 +279,8 @@ class TUI:
     MODE_SETTINGS = "settings"
     MODE_ADD_CUSTOM = "add_custom"
     MODE_CUSTOM_KEY = "custom_key"
+    MODE_CONFIRM = "confirm"
+    MODE_CONFIRM_CUSTOM_KEY = "confirm_custom_key"
 
     def __init__(self, stdscr: "curses._CursesWindow") -> None:
         self.stdscr = stdscr
@@ -202,6 +294,11 @@ class TUI:
         self.messages: List[str] = []
         self.health_map: Dict[str, List[Dict[str, str]]] = {}
         self.settings = load_settings()
+
+        # 确认页面待应用的配置
+        self.confirm_cfg: Optional[Dict] = None
+        # 自定义 Key 确认页面的 Key
+        self.confirm_custom_key: str = ""
 
         # 异步状态获取
         self.health_loading = False
@@ -255,9 +352,17 @@ class TUI:
         if not ts:
             return ""
         try:
+            # timestamp_to_iso 返回的是本地时间（无时区），用本地时间比较
             dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            now = datetime.now(timezone.utc)
+            # 如果没有时区信息，作为本地时间处理
+            if dt.tzinfo is None:
+                now = datetime.now()
+            else:
+                now = datetime.now(timezone.utc)
             diff = (now - dt).total_seconds()
+            # 处理负数（未来时间，可能是 API 返回的预定时间）
+            if diff < 0:
+                return "刚刚"
             if diff < 60:
                 return f"{int(diff)}s前"
             if diff < 3600:
@@ -364,28 +469,37 @@ class TUI:
         entries = self._group_entries(cfg)
         return self._choose_status(entries)
 
-    def get_status_detail(self, real_idx: int | None) -> Tuple[List[str], int, List[str]]:
+    def get_status_detail(self, real_idx: int | None) -> Tuple[List[Tuple[str, int]], int, List[str], List[Dict]]:
+        """返回 (状态行列表[(文本, 颜色)], 整体颜色, timeline, nodes)"""
         if real_idx is None or real_idx >= len(self.configs):
-            return ["未知"], 1, []
+            return [("未知", 1)], 1, [], []
         cfg = self.configs[real_idx]
         entries = self._group_entries(cfg)
         if not entries:
-            return ["无状态数据"], 1, []
-        lines: List[str] = []
+            return [("无状态数据", 1)], 1, [], []
+        lines: List[Tuple[str, int]] = []
         timeline: List[str] = []
+        nodes: List[Dict] = []
         for e in entries:
-            icon, _ = self._status_icon(e.get("status"))
+            icon, icon_color = self._status_icon(e.get("status"))
             tl = e.get("timeline") or []
             if tl and not timeline:
                 timeline = tl
+            # 收集节点数据
+            entry_nodes = e.get("nodes") or []
+            if entry_nodes and not nodes:
+                nodes = entry_nodes
             ago = self._fmt_ago(e.get("lastCheck", ""))
             model = e.get("model") or e.get("name") or ""
+            uptime = e.get("uptime", "")
             line = f"{icon} {model} {e.get('status','?')}"
+            if uptime:
+                line += f" {uptime}%"
             if ago:
                 line += f" ({ago})"
-            lines.append(line)
-        _, color = self._choose_status(entries)
-        return lines, color, timeline
+            lines.append((line, icon_color))
+        _, overall_color = self._choose_status(entries)
+        return lines, overall_color, timeline, nodes
 
     # ----------------- 当前环境 -----------------
     def current_env(self) -> Tuple[str, int | None]:
@@ -398,6 +512,13 @@ class TUI:
         for i, cfg in enumerate(self.configs):
             if str(cfg.get(token_key, "") or "") == token_env and str(cfg.get(url_key, "") or "") == url_env:
                 return cfg.get("name", "已匹配"), i
+        # 自定义配置：显示 URL
+        if url_env:
+            # 提取域名部分
+            import re
+            match = re.search(r'https?://([^/]+)', url_env)
+            domain = match.group(1) if match else url_env[:20]
+            return f"自定义({domain})", None
         short = f"{token_env[:8]}..." if len(token_env) > 8 else token_env or "?"
         return f"自定义({short})", None
 
@@ -418,6 +539,10 @@ class TUI:
             self._draw_add_custom(max_y, max_x)
         elif self.mode == self.MODE_CUSTOM_KEY:
             self._draw_custom_key(max_y, max_x)
+        elif self.mode == self.MODE_CONFIRM:
+            self._draw_confirm(max_y, max_x)
+        elif self.mode == self.MODE_CONFIRM_CUSTOM_KEY:
+            self._draw_confirm_custom_key(max_y, max_x)
         else:
             self._draw_list(max_y, max_x)
 
@@ -436,7 +561,7 @@ class TUI:
         self.stdscr.addnstr(0, len(title) + 1, info, max_x - len(title) - 2, curses.color_pair(2))
 
         # ─── 快捷键提示 ───
-        help_line = "↑↓j:移动  k:自定义Key  a:添加  s:设置  r:刷新  Enter:应用  q:退出"
+        help_line = "↑↓j:移动  Tab:切换  k:自定义Key  a:添加  s:设置  r:刷新  Enter:应用  q:退出"
         self.stdscr.addnstr(1, 0, help_line, max_x - 1, curses.color_pair(1) | curses.A_DIM)
 
         # ─── 搜索状态 ───
@@ -510,17 +635,61 @@ class TUI:
 
                 # 状态详情
                 real_idx = self.filtered_idx[min(self.selected, len(self.filtered_idx) - 1)]
-                status_lines, status_color, timeline = self.get_status_detail(real_idx)
+                status_lines, status_color, timeline, nodes = self.get_status_detail(real_idx)
                 status_label = "状态:" + status_suffix
                 self.stdscr.addnstr(detail_y, detail_x, status_label, detail_w, curses.A_UNDERLINE)
                 detail_y += 1
-                for sl in status_lines[:5]:
+                for sl_text, sl_color in status_lines:
                     if detail_y >= max_y - 5:
                         break
-                    self.stdscr.addnstr(detail_y, detail_x, f"  {sl[:detail_w-2]}", detail_w, curses.color_pair(status_color))
+                    self.stdscr.addnstr(detail_y, detail_x, f"  {sl_text[:detail_w-2]}", detail_w, curses.color_pair(sl_color))
                     detail_y += 1
 
-                # 历史条
+                # 检测节点
+                if nodes and detail_y < max_y - 5:
+                    detail_y += 1
+                    self.stdscr.addnstr(detail_y, detail_x, "检测节点:", detail_w, curses.A_UNDERLINE)
+                    detail_y += 1
+                    for nd in nodes[:4]:
+                        if detail_y >= max_y - 4:
+                            break
+                        node_name = nd.get("name", "")[:12]
+                        avail = nd.get("availability", 0)
+                        avail_pct = f"{avail*100:.1f}%"
+                        # 节点状态图标
+                        if avail >= 0.95:
+                            node_icon, node_color = "●", 5  # 绿色
+                        elif avail >= 0.8:
+                            node_icon, node_color = "●", 7  # 紫色
+                        else:
+                            node_icon, node_color = "●", 6  # 红色
+                        # 历史条
+                        results = nd.get("results", [])[-15:]
+                        history_bar = ""
+                        for r in results:
+                            if r == 1:
+                                history_bar += "│"
+                            elif r == 2:
+                                history_bar += "┃"
+                            else:
+                                history_bar += "█"
+                        node_line = f"  {node_icon} {node_name:<12} {avail_pct:>6}"
+                        self.stdscr.addnstr(detail_y, detail_x, node_line, len(node_line), curses.color_pair(node_color))
+                        # 绘制历史条（带颜色）
+                        bar_x = detail_x + len(node_line) + 1
+                        for i, r in enumerate(results):
+                            if bar_x + i >= detail_x + detail_w - 1:
+                                break
+                            if r == 1:
+                                bar_char, bar_color = "│", 5
+                            elif r == 2:
+                                bar_char, bar_color = "│", 7
+                            else:
+                                bar_char, bar_color = "│", 6
+                            self.stdscr.addnstr(detail_y, bar_x + i, bar_char, 1, curses.color_pair(bar_color))
+                        detail_y += 1
+
+                # 历史条（整体）
                 if timeline and detail_y < max_y - 4:
                     detail_y += 1
                     self.stdscr.addnstr(detail_y, detail_x, "历史: ", 6)
@@ -618,6 +787,118 @@ class TUI:
         self.stdscr.addnstr(max_y - 3, 2, "场景：渠道提供免费 Key，保持 URL 不变，使用新 Key", max_x - 4, curses.A_DIM)
         self.stdscr.addnstr(max_y - 2, 2, "注意：此操作不会保存到配置文件，仅设置环境变量", max_x - 4, curses.A_DIM)
 
+    def _draw_confirm(self, max_y: int, max_x: int) -> None:
+        """绘制确认应用配置页面。"""
+        cfg = self.confirm_cfg
+        if not cfg:
+            self.mode = self.MODE_LIST
+            return
+
+        cfg_map = config_loader.CONFIG_MAP[self.ai_type]
+        token_key, url_key = cfg_map["json_token"], cfg_map["json_url"]
+
+        # 标题
+        self.stdscr.addnstr(0, 0, " [确认应用配置] ", 20, curses.color_pair(4) | curses.A_BOLD)
+        self.stdscr.addnstr(1, 0, "Enter/y:确认  Esc/n:取消", max_x - 1, curses.A_DIM)
+        self.stdscr.addnstr(2, 0, "─" * (max_x - 1), max_x - 1, curses.A_DIM)
+
+        y = 4
+        # 软件类型
+        type_color = curses.color_pair(4) if self.ai_type == "claude" else curses.color_pair(5)
+        self.stdscr.addnstr(y, 2, "软件类型:", 12, curses.A_BOLD)
+        self.stdscr.addnstr(y, 14, self.ai_type.upper(), 10, type_color | curses.A_BOLD)
+        y += 2
+
+        # 渠道名称
+        self.stdscr.addnstr(y, 2, "渠道名称:", 12, curses.A_BOLD)
+        self.stdscr.addnstr(y, 14, cfg.get("name", "未知")[:max_x-16], max_x - 16, curses.color_pair(2))
+        y += 2
+
+        # 分组
+        group = cfg.get("group", "") or "-"
+        self.stdscr.addnstr(y, 2, "分组:", 12, curses.A_BOLD)
+        self.stdscr.addnstr(y, 14, group[:max_x-16], max_x - 16)
+        y += 2
+
+        # BASE URL
+        url_val = cfg.get(url_key, "") or "-"
+        self.stdscr.addnstr(y, 2, "BASE URL:", 12, curses.A_BOLD)
+        self.stdscr.addnstr(y, 14, url_val[:max_x-16], max_x - 16)
+        y += 2
+
+        # API KEY (脱敏)
+        key_val = self._mask_key(cfg.get(token_key, ""))
+        self.stdscr.addnstr(y, 2, "API KEY:", 12, curses.A_BOLD)
+        self.stdscr.addnstr(y, 14, key_val[:max_x-16], max_x - 16)
+        y += 2
+
+        # 环境变量
+        self.stdscr.addnstr(y, 2, "─" * (max_x - 4), max_x - 4, curses.A_DIM)
+        y += 1
+        self.stdscr.addnstr(y, 2, "将设置以下环境变量:", max_x - 4, curses.A_DIM)
+        y += 1
+        self.stdscr.addnstr(y, 4, f"{cfg_map['env_url']}", max_x - 6, curses.color_pair(2))
+        y += 1
+        self.stdscr.addnstr(y, 4, f"{cfg_map['env_token']}", max_x - 6, curses.color_pair(2))
+        y += 2
+
+        # 底部确认提示
+        self.stdscr.addnstr(max_y - 3, 2, "─" * (max_x - 4), max_x - 4, curses.A_DIM)
+        self.stdscr.addnstr(max_y - 2, 2, "是否确认应用此配置?", max_x - 4, curses.color_pair(4) | curses.A_BOLD)
+
+    def _draw_confirm_custom_key(self, max_y: int, max_x: int) -> None:
+        """绘制自定义 Key 确认页面。"""
+        cfg = self.confirm_cfg
+        if not cfg:
+            self.mode = self.MODE_LIST
+            return
+
+        cfg_map = config_loader.CONFIG_MAP[self.ai_type]
+        url_key = cfg_map["json_url"]
+
+        # 标题
+        self.stdscr.addnstr(0, 0, " [确认应用自定义 Key] ", 25, curses.color_pair(4) | curses.A_BOLD)
+        self.stdscr.addnstr(1, 0, "Enter/y:确认  Esc/n:取消", max_x - 1, curses.A_DIM)
+        self.stdscr.addnstr(2, 0, "─" * (max_x - 1), max_x - 1, curses.A_DIM)
+
+        y = 4
+        # 软件类型
+        type_color = curses.color_pair(4) if self.ai_type == "claude" else curses.color_pair(5)
+        self.stdscr.addnstr(y, 2, "软件类型:", 12, curses.A_BOLD)
+        self.stdscr.addnstr(y, 14, self.ai_type.upper(), 10, type_color | curses.A_BOLD)
+        y += 2
+
+        # 渠道名称
+        self.stdscr.addnstr(y, 2, "渠道名称:", 12, curses.A_BOLD)
+        self.stdscr.addnstr(y, 14, cfg.get("name", "未知")[:max_x-16], max_x - 16, curses.color_pair(2))
+        y += 2
+
+        # BASE URL (来自配置)
+        url_val = cfg.get(url_key, "") or "-"
+        self.stdscr.addnstr(y, 2, "BASE URL:", 12, curses.A_BOLD)
+        self.stdscr.addnstr(y, 14, url_val[:max_x-16], max_x - 16)
+        y += 2
+
+        # 自定义 API KEY (脱敏)
+        key_val = self._mask_key(self.confirm_custom_key)
+        self.stdscr.addnstr(y, 2, "自定义 KEY:", 12, curses.A_BOLD)
+        self.stdscr.addnstr(y, 14, key_val[:max_x-16], max_x - 16, curses.color_pair(5))
+        y += 2
+
+        # 环境变量
+        self.stdscr.addnstr(y, 2, "─" * (max_x - 4), max_x - 4, curses.A_DIM)
+        y += 1
+        self.stdscr.addnstr(y, 2, "将设置以下环境变量:", max_x - 4, curses.A_DIM)
+        y += 1
+        self.stdscr.addnstr(y, 4, f"{cfg_map['env_url']}", max_x - 6, curses.color_pair(2))
+        y += 1
+        self.stdscr.addnstr(y, 4, f"{cfg_map['env_token']} (自定义)", max_x - 6, curses.color_pair(5))
+        y += 2
+
+        # 底部确认提示
+        self.stdscr.addnstr(max_y - 3, 2, "─" * (max_x - 4), max_x - 4, curses.A_DIM)
+        self.stdscr.addnstr(max_y - 2, 2, "是否确认应用此配置?", max_x - 4, curses.color_pair(4) | curses.A_BOLD)
+
     # ----------------- 操作 -----------------
     def move(self, delta: int) -> None:
         if not self.filtered_idx:
@@ -648,10 +929,20 @@ class TUI:
         self.apply_filter()
 
     def apply_config(self) -> None:
+        """进入确认页面。"""
         cfg = self.current_cfg()
         if not cfg:
             self._msg("[错误] 无配置可应用")
             return
+        self.confirm_cfg = cfg
+        self.mode = self.MODE_CONFIRM
+
+    def do_apply_config(self) -> None:
+        """实际执行应用配置。"""
+        cfg = self.confirm_cfg
+        if not cfg:
+            return
+
         cfg_map = config_loader.CONFIG_MAP[self.ai_type]
         token_key, url_key = cfg_map["json_token"], cfg_map["json_url"]
         env_vars = {
@@ -663,6 +954,18 @@ class TUI:
             os.environ[k] = v
         self._msg(f"[已应用] {cfg.get('name','')} -> {shell_cfg.name}")
         self._msg(f"  请执行: source {shell_cfg}")
+        self.confirm_cfg = None
+        self.mode = self.MODE_LIST
+
+    def handle_confirm_key(self, ch: int) -> bool:
+        """处理确认页面的按键。"""
+        if ch in (ord('y'), ord('Y'), 10):  # y/Y/Enter 确认
+            self.do_apply_config()
+        elif ch in (ord('n'), ord('N'), 27):  # n/N/Esc 取消
+            self._msg("[取消] 未应用配置")
+            self.confirm_cfg = None
+            self.mode = self.MODE_LIST
+        return True
 
     def clear_env(self, permanent: bool) -> None:
         cfg_map = config_loader.CONFIG_MAP[self.ai_type]
@@ -785,8 +1088,8 @@ class TUI:
             return True
 
         if ch == 10:  # Enter
+            # 输入为空时忽略 Enter（避免粘贴带换行符误触发）
             if not self.custom_key_input.strip():
-                self._msg("[错误] Key 不能为空")
                 return True
 
             cfg = self.current_cfg()
@@ -795,29 +1098,53 @@ class TUI:
                 self.mode = self.MODE_LIST
                 return True
 
-            cfg_map = config_loader.CONFIG_MAP[self.ai_type]
-            url_key = cfg_map["json_url"]
-
-            # 使用选中配置的 URL + 自定义 Key
-            env_vars = {
-                cfg_map["env_token"]: self.custom_key_input.strip(),
-                cfg_map["env_url"]: str(cfg.get(url_key, "") or ""),
-            }
-            shell_cfg = env_service.write_permanent(env_vars)
-            for k, v in env_vars.items():
-                os.environ[k] = v
-
-            self._msg(f"[已应用] {cfg.get('name','')} + 自定义Key -> {shell_cfg.name}")
-            self._msg(f"  请执行: source {shell_cfg}")
-            self.mode = self.MODE_LIST
+            # 进入确认页面
+            self.confirm_cfg = cfg
+            self.confirm_custom_key = self.custom_key_input.strip()
+            self.mode = self.MODE_CONFIRM_CUSTOM_KEY
             return True
 
         if ch in (curses.KEY_BACKSPACE, 127, 8):
             self.custom_key_input = self.custom_key_input[:-1]
-        elif 32 <= ch <= 126:
+        elif 32 <= ch <= 126:  # 可打印字符，排除换行符
             self.custom_key_input += chr(ch)
+        # 忽略换行符等控制字符，避免粘贴时误触发
 
         return True
+
+    def handle_confirm_custom_key(self, ch: int) -> bool:
+        """处理自定义 Key 确认页面的按键。"""
+        if ch in (ord('y'), ord('Y'), 10):  # y/Y/Enter 确认
+            self.do_apply_custom_key()
+        elif ch in (ord('n'), ord('N'), 27):  # n/N/Esc 取消
+            self._msg("[取消] 未应用自定义 Key")
+            self.confirm_cfg = None
+            self.confirm_custom_key = ""
+            self.mode = self.MODE_LIST
+        return True
+
+    def do_apply_custom_key(self) -> None:
+        """实际执行应用自定义 Key。"""
+        cfg = self.confirm_cfg
+        if not cfg:
+            return
+
+        cfg_map = config_loader.CONFIG_MAP[self.ai_type]
+        url_key = cfg_map["json_url"]
+
+        env_vars = {
+            cfg_map["env_token"]: self.confirm_custom_key,
+            cfg_map["env_url"]: str(cfg.get(url_key, "") or ""),
+        }
+        shell_cfg = env_service.write_permanent(env_vars)
+        for k, v in env_vars.items():
+            os.environ[k] = v
+
+        self._msg(f"[已应用] {cfg.get('name','')} + 自定义Key -> {shell_cfg.name}")
+        self._msg(f"  请执行: source {shell_cfg}")
+        self.confirm_cfg = None
+        self.confirm_custom_key = ""
+        self.mode = self.MODE_LIST
 
     # ----------------- 主循环 -----------------
     def run(self) -> None:
@@ -842,6 +1169,14 @@ class TUI:
                 self.handle_custom_key(ch)
                 continue
 
+            if self.mode == self.MODE_CONFIRM:
+                self.handle_confirm_key(ch)
+                continue
+
+            if self.mode == self.MODE_CONFIRM_CUSTOM_KEY:
+                self.handle_confirm_custom_key(ch)
+                continue
+
             # 列表模式
             if ch in (ord("q"), ord("Q")):
                 break
@@ -853,7 +1188,7 @@ class TUI:
                 self.enter_custom_key()
             elif ch == 10:  # Enter
                 self.apply_config()
-            elif ch in (ord("t"), ord("T")):
+            elif ch in (ord("t"), ord("T"), ord("\t")):
                 self.toggle_ai()
             elif ch == ord("/"):
                 self.prompt_search()
@@ -873,7 +1208,10 @@ class TUI:
 
 
 def main() -> None:
-    curses.wrapper(lambda stdscr: TUI(stdscr).run())
+    try:
+        curses.wrapper(lambda stdscr: TUI(stdscr).run())
+    except KeyboardInterrupt:
+        pass  # Ctrl+C 优雅退出
 
 
 if __name__ == "__main__":

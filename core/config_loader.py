@@ -8,10 +8,17 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-SCRIPT_DIR = Path(__file__).resolve().parent.parent
+# PyInstaller 打包后 __file__ 指向临时解压目录，需要用 sys.executable 获取真实路径
+if getattr(sys, 'frozen', False):
+    # PyInstaller 打包后的可执行文件
+    SCRIPT_DIR = Path(sys.executable).resolve().parent
+else:
+    # 普通 Python 运行
+    SCRIPT_DIR = Path(__file__).resolve().parent.parent
 
 CONFIG_MAP = {
     "claude": {
